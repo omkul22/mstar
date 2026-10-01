@@ -15,6 +15,7 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "omnivoice": ("mstar.model.omnivoice.omnivoice_model", "OmniVoiceModel"),
     "kokoro": ("mstar.model.kokoro.kokoro_model", "KokoroModel"),
     "orpheus": ("mstar.model.orpheus.orpheus_model", "OrpheusModel"),
+    "personaplex": ("mstar.model.personaplex.personaplex_model", "PersonaPlexModel"),
     "pi05": ("mstar.model.pi05.pi05_model", "Pi05Model"),
     "qwen3_omni": ("mstar.model.qwen3_omni.qwen3_omni_model", "Qwen3OmniModel"),
     "qwen3_tts": ("mstar.model.qwen3_tts.qwen3_tts_model", "Qwen3TTSModel"),
@@ -61,6 +62,10 @@ HF_MODELS: dict[str, dict] = {
     # Kokoro-82M TTS: misaki G2P + PL-BERT prosody + iSTFTNet decoder, 54 bundled voices.
     "kokoro": {"model_path_hf": "hexgrad/Kokoro-82M"},
     "orpheus": {"model_path_hf": "canopylabs/orpheus-3b-0.1-ft"},
+    # Gated: accept NVIDIA's license on the model page and use a token with
+    # access. Voice presets come from the same repo's voices.tgz and are
+    # passed to the model as model_kwargs.voice_dir (configs/personaplex.yaml).
+    "personaplex": {"model_path_hf": "nvidia/personaplex-7b-v1"},
     # Pi0.5 PyTorch port published by lerobot — single safetensors blob
     # (~14 GB). mstar/model/pi05/weight_loader.py handles the lerobot->mstar
     # state-dict remap inside Pi05Model.get_submodule().
