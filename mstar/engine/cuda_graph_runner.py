@@ -17,7 +17,7 @@ from mstar.engine.cuda_graph_config import (
     PiecewiseCudaGraphConfig,
 )
 from mstar.engine.resources import BucketKey, CGSlotSpec, Resource, SlotLease, StepContext, StepRunner
-from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
+from mstar.model.submodule_base import BatchedModelOutput, ModelInputsFromEngine, NodeInputs, NodeSubmodule
 from mstar.utils import profiler
 
 logger = logging.getLogger(__name__)
@@ -223,7 +223,7 @@ class DummyRowPool:
         held = self._held.setdefault(key, [])
         rids = self.handles(key, bs)
         for rid in rids[len(held):]:
-            self._step_runner.ingest_request(rid)
+            self._step_runner.ingest_capture_row(rid)
             held.append(rid)
         return rids
 
@@ -252,7 +252,7 @@ class CudaGraphSlot:
     # preprocess output as captured; tensor entries are the static buffers
     static_inputs: dict[str, Any]
     static_input_keys: tuple[str, ...]
-    static_outputs: dict
+    static_outputs: BatchedModelOutput
     # padding rows address these; their streams stay resident between steps
     dummy_rids: list[int]
     dummy_metadata: dict[int, CurrentForwardPassInfo]
@@ -553,7 +553,7 @@ class CudaGraphRunner:
         lease = SlotLease(slot=spec.slot, bucket=spec.bucket)
         step = self._submodule.declare_step(
             graph_walk=walk, request_ids=dummy_rids, inputs=dummy_inputs,
-            slot_lease=lease,
+            slot_lease=lease, per_request_info=engine_inputs.per_request_info,
         )
         if step is not None:
             step = replace(step, _ctx=StepContext(
@@ -621,6 +621,7 @@ class CudaGraphRunner:
             graph, output = capture_into_graph(
                 run_forward, self._memory_pool, self._device, self._autocast_dtype,
             )
+            output = BatchedModelOutput.coerce(output)
 
             return self._build_slot_from_capture(
                 output=output,
@@ -632,9 +633,9 @@ class CudaGraphRunner:
                 config_idx=spec.config_idx,
             )
         finally:
-            # pages stay with the dummy streams: replay's padding rows address
-            # the same ids, so their plan finds the storage already resident
-            self._dummy_rows.reset(dummy_rids)
+            # Capture ran the dummy rows as real requests; free their storage
+            # now, since replay's padding rows address the sink page and slot.
+            self._dummy_rows.reset(dummy_rids, free=True)
 
     def _forward_for(self, spec: CGSlotSpec):
         """The callable this bucket captures, compiled once per config.
@@ -749,13 +750,16 @@ class CudaGraphRunner:
 
         A walk may have several captures (e.g. one per image resolution, each a
         fixed shape with its own token count), so every matching bucket is
-        considered rather than the first config declared.
+        considered rather than the first config declared. ``num_tokens`` counts
+        the batch's input tokens; a bucket is keyed by the tokens its plan
+        carries, so the request is scaled by that config's multiplier.
         """
         best: BucketKey | None = None
         for key, bucket in self._buckets.items():
             if key.graph_walk != graph_walk or key.cg_key_info != cg_key_info:
                 continue
-            if key.bs < bs or key.num_tokens < num_tokens or not bucket.slots:
+            needed = num_tokens * bucket.config.total_tokens_multiplier
+            if key.bs < bs or key.num_tokens < needed or not bucket.slots:
                 continue
             if best is None or (key.num_tokens, key.bs) < (best.num_tokens, best.bs):
                 best = key
@@ -791,6 +795,13 @@ class CudaGraphRunner:
             if best is None or (key.bs, key.num_tokens) < (best.bs, best.num_tokens):
                 best = key
         return best
+
+    def captures_walk(self, graph_walk: str) -> bool:
+        """Whether any capture replays this walk."""
+        return any(
+            graph_walk in config.replay_graph_walks
+            for config in self._capture_configs
+        )
 
     def max_batch_size_for(self, graph_walk: str) -> int | None:
         """Largest batch this walk was captured for, or None for no cap.
@@ -961,11 +972,12 @@ class CudaGraphRunner:
     def release(self, lease: SlotLease, real_bs: int) -> None:
         """Return the padding rows to their at-rest state after a step.
 
-        Their pages stay resident (``free=False``), so the next step's plan for
-        this slot allocates nothing for the tail.
+        Padding rows (`is_padding_row`) run against SINK_PAGE and the recurrent
+        pool's sink slot, so nothing stays resident: padding must never compete
+        with real requests for storage.
         """
         dummy_rids = self.slot_for(lease).dummy_rids
-        self._dummy_rows.reset(dummy_rids[real_bs:lease.bucket.bs])
+        self._dummy_rows.reset(dummy_rids[real_bs:lease.bucket.bs], free=True)
 
     def plan_stream(self) -> torch.cuda.Stream | None:
         """Dedicated stream for pre-planning.
@@ -1259,7 +1271,7 @@ class PiecewiseCudaGraphRunner:
             dummy_rids, shape.seq_lens, self._bucket(shape), capture=True,
             slot=slot
         )
-        call = self._call_inputs(static_inputs, dummy_rids)
+        call = self._call_inputs(static_inputs, dummy_rids, step)
 
         fn = self._config.capture_fn
         if self._config.compile:
@@ -1307,12 +1319,16 @@ class PiecewiseCudaGraphRunner:
         self,
         static_inputs: dict[str, torch.Tensor],
         step_ids: list[int],
+        step=None,
     ) -> PiecewiseCallInputs:
         """What the region is handed, over the padded capture batch.
 
         Built once, for the capture: the region's Python runs only there, so
         the rows are the runner's padding ids and the only thing a replay
-        changes is the contents of the static buffers.
+        changes is the contents of the static buffers. ``step`` is the
+        capture's declaration, so the region can tell it runs on a leased
+        slot (its context names the lease) and record the in-graph reads of
+        the slot's buffers a replay relies on.
         """
         return PiecewiseCallInputs(
             static_inputs=static_inputs,
@@ -1320,6 +1336,7 @@ class PiecewiseCudaGraphRunner:
                 request_ids=list(step_ids),
                 per_request_info=dummy_metadata(step_ids, PIECEWISE_WALK),
                 resources=dict(self._resources),
+                step=step,
             ),
             kwargs=self._config.forward_kwargs,
         )

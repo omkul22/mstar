@@ -5,6 +5,7 @@ APIServer + model are stubbed so adapters, serving handlers, SSE, and error
 paths are all exercised without the engine.
 """
 
+import asyncio
 import base64
 import json
 import sys
@@ -57,19 +58,31 @@ class _StubAPI:
         self.last_raw_request = raw_request
         return self._chunks.get(request_id, [])
 
-    async def iter_result_chunks(self, request_id):
+    async def iter_result_chunk_batches(self, request_id):
         # Same contract as the real one: a consumer that stops early, or an
-        # exception, aborts the request; a fully drained stream does not.
+        # exception, aborts the request; a fully drained stream does not. The
+        # chunks come the way the server hands them out, in batches (here all
+        # at once), so the streaming handlers see the coalesced form.
         finished = False
         try:
-            for c in self._chunks.get(request_id, []):
-                yield c
+            chunks = self._chunks.get(request_id, [])
+            if chunks:
+                yield list(chunks)
             if self.raise_after is not None:
                 raise self.raise_after
             finished = True
         finally:
             if not finished:
                 self.aborted.append(request_id)
+
+    async def iter_result_chunks(self, request_id):
+        batches = self.iter_result_chunk_batches(request_id)
+        try:
+            async for batch in batches:
+                for c in batch:
+                    yield c
+        finally:
+            await batches.aclose()
 
 
 @pytest.fixture
@@ -126,7 +139,7 @@ def test_chat_rejects_malformed_data_url_as_bad_request(client_and_stub):
         },
     )
     assert r.status_code == 400
-    assert r.json()["error"]["type"] == "server_error"
+    assert r.json()["error"]["type"] == "invalid_request_error"
 
 
 def test_chat_audio_output(client_and_stub):
@@ -155,6 +168,33 @@ def test_audio_speech(client_and_stub):
     assert r.status_code == 200
     assert r.headers["content-type"] == "audio/wav" and r.content[:4] == b"RIFF"
     assert stub.last_submit["model_kwargs"]["voice"] == "tara"
+
+
+@pytest.mark.parametrize("exc,status", [
+    (ValueError("ref_audio must be a data URL or an http(s) URL"), 400),  # the request's fault
+    (OSError("No space left on device"), 500),  # the server's
+])
+def test_speech_maps_adapter_errors(client_and_stub, monkeypatch, exc, status):
+    from mstar.api_server.openai import adapters
+
+    def raising(self, req, upload_dir):
+        raise exc
+
+    client, stub = client_and_stub
+    stub.model_name = "orpheus"
+    monkeypatch.setattr(adapters.OrpheusAdapter, "speech_to_request", raising)
+    r = client.post("/v1/audio/speech", json={"model": "orpheus", "input": "hi", "voice": "tara"})
+    assert r.status_code == status and str(exc) in r.json()["error"]["message"]
+    assert stub.last_submit is None
+
+
+@pytest.mark.parametrize("seed,status", [(2**63 - 1, 200), (-(2**63), 200), (2**63, 422), (-(2**63) - 1, 422)])
+def test_speech_seed_is_an_int64(client_and_stub, seed, status):
+    client, stub = client_and_stub
+    stub.model_name = "orpheus"
+    stub.next_chunks = [_Chunk("audio", _pcm([100, -100]), {"sample_rate": 24000})]
+    r = client.post("/v1/audio/speech", json={"model": "orpheus", "input": "hi", "voice": "tara", "seed": seed})
+    assert r.status_code == status
 
 
 def test_images(client_and_stub):
@@ -273,6 +313,40 @@ def test_videos_stream_ndjson(client_and_stub):
     assert _b64.b64decode(body["data"][0]["b64_json"]) == b"mp4-full"
 
 
+def test_chat_stream_sends_a_batch_of_tokens_as_one_frame():
+    """Tokens that were waiting together leave as one body frame (one write
+    on the socket), still one SSE event per token for the client; a chunk
+    of another modality gets a frame of its own."""
+    from mstar.api_server.openai.serving_chat import _stream
+
+    class _Batches:
+        async def iter_result_chunk_batches(self, request_id):
+            yield [_Chunk("text", b"a"), _Chunk("text", b"b"), _Chunk("text", b"c")]
+            yield [_Chunk("text", b"d"), _Chunk("audio", b"\x00\x01"), _Chunk("text", b"e")]
+
+    async def _collect():
+        return [frame async for frame in _stream(_Batches(), "bagel", "rid", 24000)]
+
+    frames = asyncio.run(_collect())
+    # role, abc, d, audio, e, stop, DONE
+    assert [f.count("data: ") for f in frames] == [1, 3, 1, 1, 1, 1, 1]
+    events = [json.loads(l[6:]) for f in frames[:-1] for l in f.splitlines() if l.startswith("data: ")]
+    assert "".join(e["choices"][0]["delta"].get("content", "") for e in events) == "abcde"
+    assert events[5]["choices"][0]["delta"]["audio"]["data"] == base64.b64encode(b"\x00\x01").decode()
+    assert events[-1]["choices"][0]["finish_reason"] == "stop"
+    assert frames[-1] == "data: [DONE]\n\n"
+
+
+def test_sse_event_is_one_json_line():
+    from mstar.api_server.openai._util import sse
+
+    obj = {"choices": [{"delta": {"content": "h\u00e9llo \"q\""}}], "n": 1}
+    line = sse(obj)
+    assert line.startswith("data: ") and line.endswith("\n\n")
+    assert "\n" not in line[:-2]
+    assert json.loads(line[6:-2]) == obj
+
+
 def test_chat_stream_reports_a_failed_request_in_band(client_and_stub):
     """A request that fails after the stream opened ends with an error event,
     not a ``finish_reason: stop`` that reads as a complete answer."""
@@ -361,6 +435,65 @@ def test_api_resolves_from_main_module(monkeypatch):
     assert router_mod._api() is stub
 
 
+def test_images_edits_forwards_size(client_and_stub):
+    """``size`` is a known field of the multipart route but still has to reach the adapter: an edit at
+    768x1024 used to come back at the reference's size because the field was dropped."""
+    client, stub = client_and_stub
+    stub.model_name = "bagel"
+    stub.next_chunks = [_Chunk("image", b"\x89PNGedited")]
+    resp = client.post(
+        "/v1/images/edits",
+        files={"image": ("in.png", b"\x89PNGinput", "image/png")},
+        data={"prompt": "make it neon", "size": "768x1024"},
+    )
+    assert resp.status_code == 200
+    assert stub.last_submit["model_kwargs"].get("size") == "768x1024"
+
+
+def test_image_routes_report_validation_errors_as_400(client_and_stub):
+    """A ValueError raised while building or validating the request is the client's fault (400, not 500)."""
+    client, stub = client_and_stub
+    stub.model_name = "bagel"
+
+    def reject(**kw):
+        raise ValueError("size must be 'WxH'")
+
+    stub.submit_request = reject
+    resp = client.post("/v1/images/generations", json={"model": "bagel", "prompt": "a cat", "size": "big"})
+    assert resp.status_code == 400 and "WxH" in resp.json()["error"]["message"]
+    resp = client.post(
+        "/v1/images/edits",
+        files={"image": ("in.png", b"\x89PNGinput", "image/png")},
+        data={"prompt": "make it neon", "size": "big"},
+    )
+    assert resp.status_code == 400
+
+
+def _refuse(**kw):
+    raise ValueError("size must be 'WxH'")
+
+
+@pytest.mark.parametrize("model,path,body", [
+    ("bagel", "/v1/chat/completions", {"json": {"messages": [{"role": "tool", "content": "sunny"}]}}),
+    ("orpheus", "/v1/audio/speech", {"json": {"input": "hi", "response_format": "xyz"}}),
+    ("whisper_large", "/v1/audio/transcriptions",
+     {"data": {"long_form": "xyz"}, "files": {"file": ("a.wav", b"RIFF", "audio/wav")}}),
+    ("bagel", "/v1/images/generations", {"json": {"prompt": "a cat"}}),
+    ("bagel", "/v1/images/edits",
+     {"data": {"prompt": "make it neon"}, "files": {"image": ("in.png", b"\x89PNGinput", "image/png")}}),
+    ("wan22", "/v1/videos/generations", {"json": {"prompt": "x", "video": "data:video/mp4;base64,AAAA"}}),
+], ids=["chat", "speech", "transcriptions", "images", "edits", "videos"])
+def test_every_route_calls_a_400_an_invalid_request_error(client_and_stub, model, path, body):
+    """OpenAI types a 400 ``invalid_request_error``: the request is at fault, and sending it again gets the same
+    400. ``server_error`` says the opposite."""
+    client, stub = client_and_stub
+    stub.model_name = model
+    stub.submit_request = _refuse  # bagel's image adapters refuse no field, so its routes refuse at submit
+    r = client.post(path, **body)
+    assert r.status_code == 400
+    assert r.json()["error"]["type"] == "invalid_request_error", "a 400 reads as the server's fault"
+
+
 def test_audio_voices_lists_model_voices(client_and_stub):
     client, stub = client_and_stub
     stub.model_name = "orpheus"
@@ -384,6 +517,49 @@ def test_audio_voices_404_for_non_speech_model(client_and_stub):
     client, stub = client_and_stub
     stub.model_name = "bagel"
     assert client.get("/v1/audio/voices").status_code == 404
+
+
+@pytest.mark.parametrize("body", [
+    {"response_format": "xyz"},
+    {"response_format": "aac"},
+    {"response_format": "mp3", "stream": True},
+    {"response_format": "opus", "stream": True},
+])
+def test_speech_refuses_a_format_it_cannot_produce(client_and_stub, body):
+    client, stub = client_and_stub
+    stub.model_name = "orpheus"
+    stub.next_chunks = [_Chunk("audio", _pcm([1, 2, 3]))]
+    r = client.post("/v1/audio/speech", json={"input": "hi", **body})
+    assert r.status_code == 400 and "response_format" in r.json()["error"]["message"]
+    assert stub.last_submit is None  # refused before any work was submitted
+
+
+@pytest.mark.parametrize("ref,message", [
+    ("/etc/passwd", "paths on the server are refused"),
+    ("file:///etc/passwd", "paths on the server are refused"),
+    (123, "got int"),
+    ({"url": "x"}, "got dict"),
+])
+def test_chatterbox_adapter_refuses_a_bad_ref_audio(ref, message, tmp_path):
+    # refused as a client error (ValueError) before anything is opened
+    from mstar.api_server.openai import adapters
+    from mstar.api_server.openai.protocol import SpeechRequest
+
+    req = SpeechRequest.model_validate({"model": "chatterbox", "input": "hi", "ref_audio": ref})
+    with pytest.raises(ValueError, match=message):
+        adapters.ChatterboxAdapter().speech_to_request(req, tmp_path)
+
+
+@pytest.mark.parametrize("fmt,magic", [("mp3", None), ("flac", b"fLaC"), ("opus", b"OggS")])
+def test_speech_encodes_the_requested_container(client_and_stub, fmt, magic):
+    pytest.importorskip("soundfile")
+    client, stub = client_and_stub
+    stub.model_name = "orpheus"
+    stub.next_chunks = [_Chunk("audio", _pcm(list(range(0, 24000, 7))))]
+    r = client.post("/v1/audio/speech", json={"input": "hi", "response_format": fmt})
+    assert r.status_code == 200 and r.content[:4] != b"RIFF"  # not WAV under another name
+    if magic:
+        assert r.content[:4] == magic
 
 
 def test_speech_stream_pcm_has_no_wav_header(client_and_stub):

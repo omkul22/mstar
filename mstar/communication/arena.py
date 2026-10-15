@@ -640,7 +640,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         """
         if self.tensor_store.is_registered(uuid):
             return False
-        tensor = self.tensor_store.get_tensor(uuid)
+        tensor = self._send_source(uuid)
         t0 = time.perf_counter()
         t = tensor.detach().contiguous()
         nbytes = t.numel() * t.element_size()
@@ -657,8 +657,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
             # file read for exactly those).
             data = _serialize_tensor(t)
             path = self._shm_path(self.my_entity_id, uuid)
-            with self._create_shm_file(path) as f:
-                f.write(data)
+            self._write_shm_file(path, data)
             self._shm_files[uuid] = path
             self._arena_ts[uuid] = time.monotonic()
             self.tensor_store.set_metadata(uuid, mem_registered=True)
@@ -678,8 +677,13 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
                 # Async D2H into the pinned segment when a copy stream exists
                 # (the caller's single sync covers the batch); blocking
                 # otherwise, so the descriptor can never ship ahead of the bytes.
-                host.copy_(t, non_blocking=self._d2h_stream is not None)
-                queued = True
+                if t.is_cuda:
+                    host.copy_(t, non_blocking=self._d2h_stream is not None)
+                    queued = True
+                else:
+                    # a stored host copy: a memcpy, nothing for the stream
+                    # sync to wait on
+                    host.copy_(t)
             self._arena_locs[uuid] = (seg, off)
             self._arena_ts[uuid] = time.monotonic()
         except BaseException:
@@ -734,7 +738,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         self, request_id: Rid, tensor_infos: list[TensorPointerInfo],
         skip_cuda_sync: bool = False,
     ):
-        if not skip_cuda_sync and torch.cuda.is_available():
+        if not skip_cuda_sync and self._on_cuda:
             torch.cuda.default_stream().synchronize()
         queued = False
         placements = _Placements.empty()
@@ -758,7 +762,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         uuid, and placement goes back as two columns rather than a whole
         descriptor. The whole batch stages inside one stream context and syncs
         once at the end, rather than one host-blocking sync per request."""
-        if not skip_cuda_sync and torch.cuda.is_available():
+        if not skip_cuda_sync and self._on_cuda:
             torch.cuda.default_stream().synchronize()
         queued = False
         placements = _Placements.empty()
@@ -920,6 +924,47 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
             if self._wake_q is not None:
                 self._wake_q.put(None)
                 self._wake_q = None
+
+    def cleanup_collectable(
+        self, collectable: list[int], registered: list[bool],
+    ):
+        """``_cleanup_by_uuid`` for a batch, inlined: a decode step frees one
+        tensor per request here, and the three-level call chain per uuid was
+        most of the cost. Same steps in the same order as the per-uuid form."""
+        if not collectable:
+            return
+        del registered  # no transfer engine to unregister from
+        store = self.tensor_store
+        store.mark_forgotten(collectable)
+        shard_dims = self.uuid_to_shard_dim
+        edge_names = self.uuid_to_edge_name
+        arena_ts = self._arena_ts
+        arena_locs = self._arena_locs
+        shm_files = self._shm_files
+        present = store.check_uuid_presence
+        remove = store.remove_tensor
+        for uuid in collectable:
+            try:
+                shard_dims.pop(uuid, None)
+                edge_names.pop(uuid, None)
+                if present(uuid):
+                    remove(uuid)
+                else:
+                    logger.warning(
+                        "Trying to cleanup tensor %s, but uuid not found", uuid,
+                    )
+                arena_ts.pop(uuid, None)
+                if (loc := arena_locs.pop(uuid, None)) is not None:
+                    self._arena.free(*loc)
+                if (path := shm_files.pop(uuid, None)) is not None:
+                    try:
+                        os.unlink(path)
+                    except FileNotFoundError:
+                        pass
+            except Exception as e:
+                logger.error(
+                    "Error cleaning up tensor uuid %d: %s, skipping.", uuid, e,
+                )
 
     def _cleanup_by_uuid(self, uuid: int, registered: bool | None = None):
         # Grandparent cleanup (refcounts): skip the file manager's unlink.

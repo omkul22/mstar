@@ -17,6 +17,11 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``bagel``
      - ``ByteDance-Seed/BAGEL-7B-MoT``
      - Unified multimodal model (text + image understanding and generation).
+   * - ``chatterbox`` / ``chatterbox_turbo``
+     - ``ResembleAI/chatterbox``, ``ResembleAI/chatterbox-turbo``
+     - Zero-shot voice-cloning TTS: T3 speech-token LM (Llama-520M, or GPT-2-medium
+       for Turbo) with CFG and exaggeration control, S3Gen flow-matching decoder,
+       HiFT vocoder, PerTh watermark. 24 kHz.
    * - ``cosmos3``
      - ``nvidia/Cosmos3-Nano``
      - Cosmos3 world model: t2i/t2v/i2v/v2v diffusion, robot-action modes, opt-in sound.
@@ -47,6 +52,11 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - TTS (82M, not autoregressive): misaki G2P + PL-BERT prosody + iSTFTNet
        decoder, 54 bundled voices and voice blends, sentence-chunked streaming,
        batched across requests.
+   * - ``nemotron_duplex`` *(Beta)*
+     - ``nvidia/NVIDIA-NemotronLabs-VoiceChat-11B``
+     - Full-duplex speech-to-speech (NemotronLabs VoiceChat-11B): Fast-Conformer
+       encoder + Nemotron-H hybrid Mamba-2/attention backbone + EarTTS talker +
+       RVQ codec; user speech in, agent text and 22.05 kHz speech out.
    * - ``orpheus``
      - ``canopylabs/orpheus-3b-0.1-ft``
      - TTS: Llama 3.2 3B LLM emitting audio tokens + SNAC 24 kHz decoder.
@@ -57,6 +67,10 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``pi05``
      - ``lerobot/pi05_base``
      - Pi0.5 vision-language-action robotics model (ViT encoder + LLM + flow action expert).
+   * - ``qwen3_5_{0.8,2,4,9,27}b``
+     - ``Qwen/Qwen3.5-4B``
+     - Hybrid-attention VLM (text + image in, text out): gated DeltaNet linear
+       attention interleaved with full attention, plus a ViT tower.
    * - ``omnivoice``
      - ``k2-fsa/OmniVoice``
      - Massively multilingual zero-shot TTS: masked-diffusion canvas over a Qwen3-0.6B
@@ -67,6 +81,15 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``qwen3_tts``
      - ``Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice``
      - Streaming text-to-speech with built-in speakers: Talker + 12 Hz speech codec.
+   * - ``qwen3_tts_1p7b``
+     - ``Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice``
+     - 1.7B CustomVoice: built-in speakers plus style/emotion ``instruct`` control.
+   * - ``qwen3_tts_voicedesign``
+     - ``Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign``
+     - 1.7B VoiceDesign: the voice is described by the request's ``instruct`` text.
+   * - ``qwen3_tts_base``
+     - ``Qwen/Qwen3-TTS-12Hz-1.7B-Base``
+     - 1.7B Base: zero-shot voice clone from one reference clip (x-vector, optional in-context transcript).
    * - ``vjepa2``
      - ``facebook/vjepa2-vitl-fpc64-256``
      - V-JEPA 2 video encoder + masked predictor.
@@ -82,6 +105,18 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``wan22``
      - ``Wan-AI/Wan2.2-TI2V-5B-Diffusers``
      - Wan2.2-TI2V-5B video diffusion: text-to-video and image-to-video, 5B dense DiT.
+   * - ``flux2_klein``
+     - ``black-forest-labs/FLUX.2-klein-4B``
+     - FLUX.2 [klein] 4B: step-distilled (4 steps, no CFG) text-to-image and multi-reference
+       image editing; Qwen3-4B hidden-state text encoder + FLUX.2 VAE. Apache-2.0.
+   * - ``flux2_klein_9b``
+     - ``black-forest-labs/FLUX.2-klein-9B``
+     - FLUX.2 [klein] 9B (Qwen3-8B encoder, 4096-wide DiT), same class. Released under
+       the FLUX Non-Commercial License; check it before deploying.
+   * - ``z_image_turbo``
+     - ``Tongyi-MAI/Z-Image-Turbo``
+     - Z-Image-Turbo: 8-step distilled single-stream flow DiT (6B) with a Qwen3-4B caption
+       encoder and the FLUX.1 VAE; text-to-image, no CFG. Apache-2.0. Same DiT scaffold as klein.
 
 Notes
 -----
@@ -110,6 +145,31 @@ OmniVoice notes
 - The backbone is not autoregressive: it fills a fixed canvas of eight codebook
   rows over a few unmasking steps, so there is no KV cache and no per-token
   sampling loop. Serve it with ``mstar serve omnivoice --gpus 0``.
+
+Qwen3.5 (``qwen3_5_*``)
+-----------------------
+
+Text-and-image chat on the Qwen3.5 dense family (five sizes; MoE variants are
+not supported yet; video is refused). Served on both ``POST /generate`` and
+``/v1/chat/completions`` (image parts included). Images may be interleaved with
+text anywhere in the prompt, and prefill follows the order they were written::
+
+    mstar serve qwen3_5_4b --gpus 0
+
+Most layers are gated DeltaNet, so a request holds a recurrent-state slot as
+well as a KV allocation. Set ``gdn_state.max_slots`` in
+``configs/qwen3_5_*.yaml`` to the concurrency you want plus one for the sink;
+CUDA-graph capture and padded replays use the sink, not slots. A slot is
+~20 MiB for the 0.8B and ~50 MiB for the 27B at TP4 (half that in bf16), hence
+not the 256-slot default. The state defaults to the checkpoint's
+``mamba_ssm_dtype`` (fp32 for the released checkpoints, as in vLLM);
+``gdn_state.state_dtype: bfloat16`` halves state traffic at some precision and
+needs FlashInfer's fused bf16 decode kernel (K = V = 128).
+
+``temperature``, ``top_p``, ``max_tokens`` and ``seed`` are the standard fields.
+``repetition_penalty`` and ``enable_thinking`` (default true; the template opens
+a ``<think>`` block) are read by the model but are not OpenAI fields — pass them
+via ``extra_body``.
 
 Kokoro notes
 ------------
@@ -159,25 +219,68 @@ Qwen3-TTS notes
 ---------------
 
 - Install the model-specific dependencies with ``pip install -e '.[qwen3_tts]'``
-  and launch the default single-GPU deployment with
-  ``mstar serve qwen3_tts --gpus 0``.
-- The first integration supports the CustomVoice checkpoint and text-to-audio
-  requests. ``voice`` selects one of the checkpoint's built-in speakers and
-  ``language`` defaults to automatic detection.
-- Codec CUDA graphs are captured through batch size 8. The upstream decoder's
-  batch-16 capture can exhaust an H100 after Talker weights and CodePredictor
-  graphs are resident; larger Codec batches therefore use the scheduler's safe
-  ceiling.
-- Talker prefill remains eager because it runs once with variable sequence
-  lengths. Decode always uses the whole-walk CUDA Graph, with the 15-step
+  and launch a single-GPU deployment with ``mstar serve <key> --gpus 0`` where
+  ``<key>`` is one of ``qwen3_tts`` (0.6B CustomVoice), ``qwen3_tts_1p7b``,
+  ``qwen3_tts_voicedesign`` or ``qwen3_tts_base``. One model class serves every
+  12 Hz checkpoint; the variant (speakers, instruction support, reference
+  audio) is read from the checkpoint's ``config.json``.
+- Requests: ``voice`` selects a built-in speaker (CustomVoice), ``language``
+  defaults to automatic detection, ``instruct`` (OpenAI: ``instructions``)
+  carries a style instruction (1.7B CustomVoice) or the voice description
+  (VoiceDesign, required). Base clones a voice from one reference clip: on
+  ``/v1/audio/speech`` pass ``ref_audio`` (data URL, URL, path or base64) plus
+  ``ref_text`` (its transcript) or ``x_vector_only_mode: true``; with the SDK,
+  ``client.tts(text, reference_audio="ref.wav", ref_text="...")``. The clip's
+  conditioning (x-vector and codec frames) is memoised by content, so a voice
+  reused across requests, or by the sentence chunks of one long request, is
+  encoded once; named, persisted voices arrive with the shared voice registry.
+- Text layout follows the reference defaults: CustomVoice and VoiceDesign put
+  the whole text in the prefill; Base feeds it one token per frame. Override
+  per request with ``non_streaming_mode``.
+- ``/v1/audio/speech`` inputs of 600 or more characters are synthesized as
+  ordered sentence chunks of about 400 characters (one Talker request each,
+  two kept in flight while the current one streams); set
+  ``sentence_chunking: false`` (or ``true`` for shorter texts) per request.
+- Audio streams in a ramp of codec chunks: the first frame is decoded on its
+  own (first audio one Talker step after prefill), the next windows add 3, 8
+  and 16 frames, then 25 new frames behind up to 72 frames of already decoded
+  left context, the decoder transformer's sliding window (as vLLM-Omni). The
+  transformer stacks 8 such layers, so a window still differs slightly from a
+  whole-utterance decode once an utterance outgrows the context; 25 frames of
+  context differed far more. Each window size is a CUDA-graph bucket captured
+  for batch sizes 1 to 32; the stream buffer reports how many leading frames of
+  a window are repeated context, and the codec trims their audio. A voice
+  clone's reference tail (its last 72 frames) is the first window's context.
+- The codec runs its transformer over the whole window but its conv stack (all
+  but a few percent of the codec's time) only over the new frames plus the
+  stack's causal receptive field, derived from the decoder's modules at load
+  (10 frames for the 12 Hz decoder; the new frames' audio equals the
+  whole-window decode). It also fuses the SnakeBeta activations into one kernel.
+- Talker prefill replays a packed CUDA Graph for the smallest token bucket
+  (32 to 1024 tokens) that holds the batch; only the clone prefill, which also
+  pushes the reference clip's frames into the codec stream, runs eager. Decode
+  always uses the whole-walk CUDA Graph, with the 15-step
   CodePredictor loop captured inside it; request-local EOS suppression is
   carried as a graph tensor input so replay does not consult capture-slot dummy
   request state. Residual ``subtalker_*`` sampling is per-request through the
   ``code_predictor`` aux sampler, so custom values neither block batching nor
-  fall off the graph.
-- The 12 Hz decoder does not require the system SoX executable. M* imports only
-  the exact upstream decoder modules, avoiding qwen-tts's unrelated 25 Hz SoX
-  probe during worker startup.
+  fall off the graph. On the 1.7B checkpoints the CodePredictor projects the
+  Talker-width inputs through ``small_to_mtp_projection`` before its depth loop.
+- ``configs/qwen3tts_1p7b_split.yaml`` runs the Codec on a second worker that
+  shares GPU 0 (``rank_devices``) and caps the Talker KV pool so both fit.
+  On its own it lowers first-audio latency at high concurrency; with a
+  user-level CUDA MPS daemon (``nvidia-cuda-mps-control -d`` before
+  ``mstar serve``) the two workers' kernels also overlap, which raised c=32
+  throughput by about a fifth on an H100.
+- The codec decoder runs in float32 by default, reproducing the reference
+  decoder bit for bit. ``model_kwargs: {codec_dtype: bfloat16}`` in the
+  deployment YAML halves its GPU time when throughput matters more than
+  bit-exactness (the Talker is bf16 either way).
+- Weight loading checks coverage in both directions: a parameter the checkpoint
+  does not fill, or a checkpoint tensor the port does not load, fails startup.
+- The 12 Hz codec does not require the system SoX executable. M* imports only
+  the exact upstream speech-tokenizer modules, avoiding qwen-tts's unrelated
+  25 Hz SoX probe during worker startup.
 
 For throughput/latency validation, run the native serving benchmark with the
 Qwen3-TTS model metadata rather than the Orpheus compatibility entry::
@@ -199,6 +302,209 @@ The benchmark stops on the model's natural codec EOS by default. Use
 fixed-length decode throughput rather than end-user latency.
 The first process-local request can include eager FlashInfer kernel JIT, so
 keep the warmup requests enabled when reporting steady-state latency.
+
+For cross-engine comparisons (M*, vLLM-Omni, SGLang-Omni) use the shared
+streaming ``/v1/audio/speech`` client, which measures time-to-first-audio, RTF
+and audio-seconds per second with the same request for every engine, and score
+the saved WAVs with ``benchmark/tts_speech_wer.py``::
+
+   python -m benchmark.tts_speech_bench --engine mstar --url http://127.0.0.1:8000 \
+       --model qwen3_tts_1p7b --sentences sentences_200.txt --voice vivian \
+       --language English --concurrency 8 --repeats 3 --out results/mstar_c8.json
+Nemotron VoiceChat (``nemotron_duplex``) notes
+----------------------------------------------
+
+- Four nodes in four async partitions, joined by streaming edges:
+  ``conformer_encoder`` (16 kHz audio → one LLM-space embedding per 80 ms frame)
+  → ``nano_llm`` (frame-synchronous decode loop: each step fuses one audio frame
+  with the previous agent-text and tool-call tokens, emits one agent-text token)
+  → ``eartts_talker`` (one text token → 31 RVQ codes) → ``audio_codec`` (codes →
+  PCM: each 5-frame chunk is decoded with the previous 3 frames as left context,
+  which covers the decoder's receptive field, and a window's last 12 samples,
+  the inverse-STFT overlap, are held back and emitted with the next chunk, so
+  the stream equals the full-history decode sample for sample).
+  The decode loops are stream-terminated: they end when the upstream stream
+  closes, not on EOS, which is an ordinary per-frame token in duplex speech.
+- ``nano_llm`` declares a paged KV cache over its four attention layers with
+  the attention plan on it (``resources: nano_kv`` / ``nano_attn``; no
+  positional encoding, so no position resource), a recurrent-state pool holding
+  the 27 Mamba-2 layers' conv window and SSM state, one slot per session
+  (``mamba_state``: 32 sessions by default, ~137 MB per slot in fp32, tunable
+  with ``max_slots`` / ``state_dtype``; the shipped configs set
+  ``max_concurrent_requests: 32`` to match, so raise the two together), the Mamba-2 resource planned on it
+  (``mamba``) and the agent-text sampler (``nano_sampler``). Its decode step is
+  captured as a CUDA graph for batch sizes 1 to 32.
+- ``eartts_talker`` advances every live session in one backbone pass per frame
+  through the engine's paged KV (``talker_kv`` / ``talker_attn`` /
+  ``talker_pos``): each session owns two streams, the conditional and the
+  unconditional CFG context, planned together under one combined label, so a
+  step is one packed batch of two tokens per session (a session's first step
+  prefills its 38-token speaker/text warm-up instead). The pool's head dim is
+  128: FlashInfer computes 64/128/256 exactly and returns wrong values for the
+  talker's 72, so q/k/v are zero-padded (exact) and RoPE is applied in torch
+  from the positions the position resource planned. Sampling noise is drawn
+  per row from the request's seeded generator before the step, so a session's
+  speech does not depend on which other sessions share it. The per-frame step
+  is captured as a CUDA graph for 1 to 32 sessions; a session's first step
+  (its 38-token speaker warm-up) runs eager. The talker KV pool is 1025 pages
+  of 128 positions (28 GiB): 32 sessions x 2 streams x 16 pages plus a sink
+  page, enough for ``max_session_s`` (160 s) per session, with no
+  sliding-window eviction yet; longer audio gets a 400.
+- Measured on one H100 80GB (``benchmark/nemotron_duplex/sessions.py`` on the
+  106-frame demo clip, three repeats): 24-25 ms per 80 ms tick with one
+  session, 61-64 ms with 32 concurrent sessions, 76-85 ms with 40, 87-92 ms
+  with 48 and 95-97 ms with 64 (2026-10-08). 32 is the most that keep up with
+  real time, hence the shipped cap; every session received all its frames. Served audio is checked for intelligibility by
+  transcribing it (``test/nemotron_duplex/asr_check.py``, Whisper
+  large-v3-turbo): MaskGIT sampling is knife-edge, so attention-backend
+  numerics change the waveform but not the words.
+- Against vLLM-Omni 0.28's native duplex serving of the same checkpoint (three
+  eager fp32 engines, one session per GPU by its deploy config, its realtime
+  client): on the demo clip both systems' response latency is the model's
+  turn-taking decision (first agent text about 1.8 s after the user stops;
+  first voiced audio 1.6 s here vs 2.0 s in stream time there, 2.3-2.6 s wall
+  there), while M* serves 32 concurrent sessions with margin on one H100.
+- The nano text tokenizer is read from the ``nano/`` folder of
+  ``pipecat-ai/NVIDIA-NemotronLabs-VoiceChat-11B-Spark`` (the base checkpoint
+  ships only the RNN-T tokenizer); prefetch both repositories on machines
+  without egress.
+- Inputs are a single user-only 16 kHz mono clip (the request's ``audio``) plus
+  an optional system prompt (the request's text, primed before the first frame
+  exactly as the reference does). The model answers in the frames *after* the
+  user stops, so append a few seconds of trailing silence to the clip. The
+  checkpoint's demo recordings are two-channel conversations (user left, agent
+  right); feed the left channel only. ``test/nemotron_duplex/duplex_request.py``
+  prepares such a clip from the bundled ``turn_taking.wav`` and sends it;
+  ``parity_compare.py`` runs the standalone reference path on the same clip
+  and checks the served text against it token for token (bf16, the serving
+  precision, must match exactly; the fp32 oracle can differ where the agent's
+  turn-taking decision is a knife-edge, which its printed logit margins show).
+- Default deployment: ``configs/nemotron_duplex.yaml`` (all four nodes on one
+  GPU); ``configs/nemotron_duplex_disagg.yaml`` puts the encoder+LLM, the talker
+  and the codec on three ranks. Launch with ``--tensor-comm-protocol SHM`` on a
+  single node. Text samples at ``temperature: 0.7, top_p: 0.9`` by default;
+  send ``temperature: 0`` for greedy. The talker's mixture-of-Gaussians sampling
+  is stochastic by design and seeded per request.
+
+Chatterbox notes
+----------------
+
+- ``pip install -e '.[chatterbox]'`` then ``mstar serve chatterbox --gpus 0``
+  (``chatterbox_turbo`` for the distilled Turbo checkpoint,
+  ``chatterbox_multilingual`` for the 23-language one). All variants are one
+  model class; the variant follows the registry key or ``model_kwargs:
+  variant``.
+- Multilingual: the same graph, S3Gen and voice encoder as the English model
+  with the ``t3_mtl23ls_v2`` T3 weights (a 2454-token grapheme vocabulary)
+  and a language token in front of the text. Requests pass ``language_id``
+  in ``extra_body`` (``ar da de el en es fi fr he hi it ja ko ms nl no pl pt
+  ru sv sw tr zh``; the deployment's ``model_kwargs: default_language``, ``en``
+  by default, applies when a request gives none). The text is lower-cased and
+  NFKD-normalised, Korean is decomposed into jamo and Chinese spelled as
+  Cangjie codes from the checkpoint's table; Japanese kana reading, Hebrew
+  diacritics and Russian stress marks use the same optional packages as the
+  reference (``pip install -e '.[chatterbox_multilingual]'`` brings
+  ``pykakasi`` and the Chinese word segmenter; ``dicta_onnx`` and
+  ``russian_text_stresser`` are installed separately) and are skipped with a
+  warning when a package is missing, as the reference does.
+- Requests: ``/v1/audio/speech`` with ``input``, ``voice`` (``default`` = the
+  voice shipped in the checkpoint, or a preset name resolved under the
+  deployment's ``model_kwargs: voices_dir``), and in ``extra_body``
+  ``ref_audio`` (data URL of a reference clip, 5-30 s, cloning; an http(s)
+  URL only when the server sets ``MSTAR_ALLOW_REMOTE=1``; paths on the
+  server are refused), ``exaggeration`` (0-2, emotion intensity, default 0.5),
+  ``cfg_weight`` (0-1, default 0.5; 0 disables guidance and halves the T3 work),
+  ``temperature`` (up to 5; under 1e-5 is greedy)/``top_p``/``top_k`` (the
+  whole vocab or more is no filter)/``min_p``/``repetition_penalty`` (up to 2;
+  the upper bounds are the reference demo's), ``seed``, ``n_cfm_timesteps``
+  (S3Gen Euler steps, 10; Turbo 2), ``max_new_tokens`` (up to the deployment's
+  ``model_kwargs: max_new_tokens_limit``, 1000 in the shipped configs; with
+  ``max_concurrent_requests`` set, the server refuses to start unless that
+  many requests of that length fit the KV cache, so raise it together with
+  ``max_num_pages`` or a lower cap),
+  ``ignore_eos`` (T3 decodes all ``max_new_tokens``
+  past the stop token, for fixed-length benchmarks; the speech tokens among
+  them are vocoded, but T3 keeps emitting stop and control tokens after the
+  end of speech and those are dropped, so the audio is shorter than
+  ``max_new_tokens`` / 25 s: 4096 tokens gave 117 s on base and 141 s on
+  Turbo, not 164 s) and ``watermark`` (default on). Turbo ignores
+  ``cfg_weight``, ``exaggeration`` and ``min_p`` like the reference package.
+  The native ``/generate`` route and ``client.tts(...)`` take the same knobs;
+  a clip uploaded as ``audio`` input is the reference voice.
+- Graph: ``voice_encoder`` (speaker LSTM + S3 tokenizer over the reference,
+  cached per clip hash) -> ``T3`` (paged KV, continuous batching; guidance runs
+  the conditional and unconditional streams through one attention plan and one
+  captured decode graph per batch size) -> ``s3gen`` (own streaming partition).
+- Outputs are watermarked with Resemble's PerTh network when ``resemble-perth``
+  is installed; ``watermark: false`` per request or in ``model_kwargs`` turns it
+  off, and a deployment without the package logs that outputs are unmarked.
+  The mark is embedded on the worker's device end to end (the package's own
+  routine resamples on the CPU); it decodes with the package's detector like
+  the package's output, from which it differs by the resampler only.
+- Streaming (``stream: true``) emits WAV chunks as the speech tokens arrive:
+  the first after 15 tokens (about 0.12 s on an H100), then 50, 100 and 200
+  tokens (``model_kwargs: stream_first_chunk_tokens`` / ``stream_chunk_tokens``
+  / ``stream_chunk_growth`` / ``stream_max_chunk_tokens``): each chunk buys
+  the playback time to produce a bigger one, so a stream costs three or four
+  flow solves instead of one per 25 tokens. Each chunk re-runs
+  the flow decoder over all tokens so far with a fixed noise field, holds back
+  the three look-ahead tokens and crossfades the vocoder tail, so the stream
+  is continuous but not sample-identical to the whole-utterance decode;
+  ``stream_chunk_tokens: 0`` synthesises whole utterances (the reference
+  path, bit-exact with the package at a fixed seed). ``stream_context_tokens``
+  (default 25; 0 = whole history) bounds how many settled tokens a chunk's
+  flow solve keeps as left context, making the per-chunk cost constant; the
+  window stays as close to the whole-utterance decode as the full history
+  does (log-mel correlation 0.988 vs 0.985 on CPU). Requests whose chunks
+  are ready together share one padded flow solve (up to 8 per step).
+- S3Gen runs from CUDA graphs by default (``s3gen_graphs``): the flow solve
+  (one graph per rows x frames x steps; the estimator's hundreds of tiny
+  kernels per Euler step make the eager solve launch-bound, 170 ms vs 45 ms
+  for one row on an H100), the token encoder (per rows x token bucket) and
+  the HiFT vocoder up to its output spectrum (per exact chunk length, its
+  excitation noise drawn outside the graph in the reference's order; the
+  inverse STFT runs eagerly since ``torch.istft`` synchronises). Rows are
+  padded to the powers
+  of two up to ``s3gen_max_batch_size`` (8) and frames to
+  ``s3gen_frame_bucket`` (64); the built-in voice's chunk shapes are captured
+  at startup, other shapes on first use; ``s3gen_graph_stages`` (default
+  ``solve,encoder,vocoder``) picks the stages. The flow estimator runs in
+  ``s3gen_estimator_dtype`` float16 by default with the Euler state in
+  float32 (within 0.02-0.15 of the float32 log-mel; ``bfloat16`` is as fast
+  and further off; ``float32`` is the reference path, bit-exact with the
+  package at a fixed seed). ``t3_prefill_graphs`` (default on) captures T3
+  prefill as packed CUDA graphs by token bucket for batches of up to four
+  requests; decode graphs are always captured. ``s3gen_graphs: false`` gives
+  the eager path; ``s3gen_compile: true`` is the older alternative and turns
+  the graphs off.
+- Sampling follows the reference order inside the sampler resource:
+  repetition penalty -> temperature -> ``min_p`` -> ``top_p``; the T3 node
+  declares ``enable_min_p`` on its ``SamplerSpec`` (see
+  :doc:`adding_models`). T3 runs in bf16 (``model_kwargs: t3_dtype:
+  float16`` is the alternative; float32 is refused because the paged
+  attention has no float32 kernels, and fp32 token parity is checked by the
+  CPU tests in ``test/chatterbox``).
+- Reference clips are decoded with ``soundfile`` (WAV/FLAC/OGG/MP3 through
+  the bundled libsndfile); other codecs fall back to ``torchcodec``, which
+  needs FFmpeg's shared libraries on the node.
+- Keep each request short, a sentence or two. Text longer than 512 tokens is
+  rejected, but quality drops well before that, as it does in the reference
+  package: on three-sentence inputs (600-720 characters) Turbo often drops or
+  babbles the last sentence (median WER 0.10, reference 0.12; base 0.02), and
+  1,500-2,000 characters come back from Turbo as a second or so of unrelated
+  speech, with a 200. For long text send ``sentence_chunking: true`` in
+  ``extra_body``: the server splits it into sentence groups of up to 400
+  characters (at most 32) and synthesises them in order, or split it
+  client-side.
+- Benchmarks and parity scripts live in ``benchmark/chatterbox/``
+  (``bench_all.sh`` drives M*, Chatterbox-TTS-Server and chatterbox-vllm on
+  one GPU; ``reference_greedy.py`` + ``serve_parity.py`` compare a served
+  greedy synthesis with the reference package; ``wer_eval.py`` is the Whisper
+  intelligibility guard; ``node_breakdown.py`` turns a served run's
+  ``--log-stats`` profiles into a per-node time table; ``profile_s3gen.py``
+  micro-benchmarks the flow estimator, solve, encoder, vocoder and watermark
+  by precision, eager vs. CUDA graph; ``gpu_util.py`` summarises
+  ``nvidia-smi dmon`` samples taken during runs).
 
 Cosmos3 environment requirements
 --------------------------------
@@ -513,3 +819,116 @@ Validation status:
      - Passing
    * - Real checkpoint load (LM and Mimi), bf16 numerics, GPU parity, serving, audio quality
      - **Not run** (gated checkpoint and GPU access pending)
+
+FLUX.2 [klein] (``flux2_klein`` / ``flux2_klein_9b``)
+-----------------------------------------------------
+
+Text-to-image and reference-image editing on the step-distilled **FLUX.2 [klein]**
+checkpoints. Four stateless nodes: a native Qwen3 encoder that runs only the 27 layers
+whose hidden states the DiT consumes (taps 9/18/27 concatenated), the rectified-flow
+transformer as the body of a ``denoise_loop`` (one Euler step per iteration, 4 by
+default, no classifier-free guidance), the FLUX.2 VAE encode of reference images and
+the VAE decode. All of them are exact ports; the CPU suite pins them bit-for-bit against
+the diffusers modules on tiny random configs and the GPU suite compares real-weight
+trajectories and PSNR against a recorded pipeline run
+(``test/flux2_klein/record_oracle.py``).
+
+Serve on one GPU and generate::
+
+   mstar serve flux2_klein --gpus 0
+   python - <<'PY'
+   from mstar import MStarClient
+   client = MStarClient("http://localhost:8000")
+   png = client.generate_image("a cat holding a sign that says hello world", width=1024, height=1024, seed=0)
+   open("cat.png", "wb").write(png)
+   open("edit.png", "wb").write(client.edit_image("make it a watercolor painting", "cat.png", seed=1))
+   PY
+
+The OpenAI routes are ``POST /v1/images/generations`` (``size`` as ``WxH``, ``seed``,
+``n``; ``num_inference_steps`` through ``extra_body``) and ``POST /v1/images/edits``
+(multipart ``image`` + ``prompt``; up to four reference images are concatenated as
+conditioning tokens, in order).
+
+Deployment knobs live under ``model_kwargs`` in ``configs/flux2_klein.yaml``:
+
+``attention_backend``
+   ``sdpa`` (default) is the reference kernel, cuDNN on an H100 and measured as fast as
+   FlashInfer in the served path. ``flashinfer`` runs the DiT's joint attention on the
+   engine's ragged FlashInfer resource; both are CUDA-graph replayable.
+
+``compile``
+   ``torch.compile`` of the transformer, one trace per shape.
+
+``compile_eager_rounding``
+   Inductor rounds intermediates where eager PyTorch does, and fuses no FMAs.
+
+``compile_exact_ops``
+   ``true``, or a list of op classes among ``norms`` and ``activations``: those modules
+   stay on the eager kernels inside the compiled forward, so inductor only fuses the
+   chains around the GEMMs and attention. Each excluded module is a graph break, so this
+   is a latency-for-exactness trade:
+
+   * The norms alone make the transformer bit-exact with eager (measured on klein-4B and
+     9B). The shipped ``[norms]`` costs klein-4B 4% of its B=1 latency (0.371 vs
+     0.356 s); excluding the activations too adds cost and nothing else.
+   * Z-Image's 180 norms per step cost 45% (1.25 vs 0.86 s at B=1), so it ships ``false``
+     and lands at a median 34 dB. ``[norms]`` turns it reference-faithful (at least
+     55.9 dB on every prompt).
+   * Without it, the plain compile — even with eager rounding — lands at a median 35 to
+     38 dB PSNR from eager over the 100 protocol prompts, because a 4- or 8-step
+     distilled sampler amplifies the last bit of inductor's own reductions and activation
+     decompositions.
+
+``cuda_graph``, ``capture_sizes``, ``capture_batch_sizes``
+   The denoise step, Euler update included, is captured per listed ``[height, width]``
+   and batch size. Other shapes run the eager batched path.
+
+``capture_edit_sizes``
+   klein only: edit buckets with one reference image of the output size, the shape of an
+   edit that keeps its reference's size. Defaults to ``capture_sizes``; ``[]`` captures
+   none. The eight edit buckets of the 1024² default cost about 8 GiB of peak VRAM on
+   klein-4B and 6 GiB on 9B, and every extra capture size adds roughly 7 minutes of
+   startup.
+
+``async_scheduling``
+   The engine's speculative scheduling of the image nodes: the worker assembles a batch's
+   next denoise step while the current one runs and merges requests that became ready
+   meanwhile, so requests at different steps share a forward. On by default; a step a
+   request speculates past its schedule is vetoed before any forward, and ``false``
+   restores lockstep. Measured on one H100 back to back against lockstep: klein-4B 0.365
+   to 0.372 s vs 0.377 to 0.390 s at B=1 and about 3% more images per second at 4 and 16
+   concurrent requests, klein-9B 2%, Z-Image neutral, served images unchanged — the
+   denoise phase is compute-bound either way.
+
+``max_batch_size``
+   Rows batched per denoise step.
+
+``vae_compile``
+   ``torch.compile`` of the VAE decode with inductor autotuning: 89 to 29 ms at 1024² on
+   an H100. Its fused reductions move the image by about 55 dB PSNR from the eager decode
+   on every prompt, and the autotuner may pick different conv kernels in another server
+   process, so set it to ``false`` for bit-exact, repeatable output — which is how the
+   parity suite runs. The compiled decode is warmed at load for the ``capture_sizes``
+   grids and the decode batch sizes; any other latent shape decodes eagerly rather than
+   paying a 40 to 100 s autotune inside a request. Memory cuts the other way: the eager
+   decode of an 8-image batch at 1024² allocates about 40 GiB of activations, for served
+   peaks of 75 GiB on klein-4B and 77 GiB on Z-Image at 16 concurrent requests against
+   36 to 44 GiB compiled.
+
+``max_image_area``
+   Pixels, default 2048². Bounds the output size a request may ask for; larger requests
+   are rejected with a 400 before scheduling instead of occupying the worker for minutes
+   (an 8192² request means 262k tokens of quadratic attention).
+
+With the klein defaults every served image is within 53 dB of the eager path on all 100
+protocol prompts, and with ``vae_compile: false`` it is bit-exact. For scale, the served
+images of the other engines are 10 to 16 dB from the diffusers reference for the same
+seeds.
+Requests at the same output size batch across users in every node, including the
+text encoder, whose input is always 512 tokens. ``lora`` lists adapters to fold into the
+transformer weights at load time (``[{path: ..., scale: ...}]``; diffusers/PEFT-format or
+BFL-layout safetensors), so a styled deployment runs at the base model's speed. The adapter's
+own scaling follows PEFT: an ``alpha`` key in the weights, else the ``lora_alpha`` (and
+``use_rslora``) of an ``adapter_config.json`` / ``config.json`` next to them, else ``alpha = r``;
+``scale`` multiplies that (a public rank-64 rsLoRA adapter lands within 53 dB of diffusers'
+fused result — M* merges in fp32 with one rounding, PEFT fuses in bf16).

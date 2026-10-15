@@ -1,10 +1,12 @@
+import itertools
 import logging
 import os
 import threading
+from collections import Counter
 from concurrent.futures import Future, wait
 from dataclasses import dataclass, field
-from typing import Any
 
+import numpy as np
 import torch
 
 from mstar.distributed.communication import JointGroups
@@ -26,15 +28,17 @@ from mstar.engine.resources.kv.cpu_page_pool import CPUPagePool
 from mstar.engine.resources.kv.keys import fingerprint, page_key
 from mstar.engine.resources.kv.plan import (
     SINK_PAGE,
+    HostLens,
     KVPlanOutput,
     KVPlanOutputs,
     PagedIndptrs,
+    PinnedIndexRing,
     SequenceView,
     build_paged_indptrs,
     group_by_plan_label,
 )
 from mstar.engine.resources.kv.prefix_index import PrefixIndex
-from mstar.engine.resources.kv.transfer import KVTransferManager, TransferEngineInfo
+from mstar.engine.resources.kv.transfer import KVTransferInfo, KVTransferManager, TransferEngineInfo
 from mstar.engine.resources.step import (
     ADMIT_OK,
     AdmitFailedReason,
@@ -45,6 +49,8 @@ from mstar.engine.resources.step import (
     Segment,
     StepContext,
 )
+from mstar.utils.h2d import PinnedStager
+from mstar.utils.knobs import kv_chain_lazy_steps, kv_pinned_indptrs, kv_plan_cache
 
 logger = logging.getLogger(__name__)
 
@@ -182,20 +188,30 @@ class CacheStream:
     # set at conversion, cleared at `commit`, so a refused admit's re-probe answers the same
     converted: bool = False
     offloaded: bool = False
+    # General mutation epoch used by plans and offload claims. Appends move it.
     generation: int = 0
+    # Logical-content epoch exported to remote readers. Unlike generation, an
+    # append does not move it; rewinds and whole-stream replacements do.
+    reset_generation: int = 0
+    # Last remote logical-content epoch this cache observed. None keeps
+    # transfer descriptors from before reset_generation compatible.
+    remote_reset_generation: int | None = None
 
     # set from a successful admit until commit: an admitted step already holds
     # addressing into these pages, so an offload in that window must not claim
     # them. read by `_claim_for_offload`
     step_in_flight: bool = False
 
-    def reset(self, freed: bool=False):
+    def reset(self, freed: bool=False, *, content_reset: bool=True):
         self.stored_len = 0
         self.position = 0
         self.released = 0
         self.protected_prefix = 0
         self.retention = None
         self.generation += 1
+        if content_reset:
+            self.reset_generation += 1
+            self.remote_reset_generation = None
         self.step_in_flight = False
 
         if freed:
@@ -229,8 +245,9 @@ LabelToStream = dict[str, CacheStream]
 class KVSequenceInfo:
     seq_len: int
     # for tracking KV cache
-    latest_kv_transfer_info: Any
+    latest_kv_transfer_info: KVTransferInfo | None
     page_indices: list[int] = field(default_factory=list)
+    reset_generation: int | None = None
 
 
 @dataclass
@@ -259,6 +276,23 @@ class PublishedKVInfo(PublishedInfo):
                 **val
             }
 
+    def clone(self) -> "PublishedKVInfo":
+        return PublishedKVInfo(
+            info={
+                rank: {
+                    label: KVSequenceInfo(
+                        seq_len=seq.seq_len,
+                        latest_kv_transfer_info=seq.latest_kv_transfer_info,
+                        page_indices=list(seq.page_indices),
+                        reset_generation=seq.reset_generation,
+                    )
+                    for label, seq in labels.items()
+                }
+                for rank, labels in self.info.items()
+            },
+            world_size=self.world_size,
+        )
+
     def get(self, rank: int) -> dict[str, KVSequenceInfo]:
         return self.info.get(rank, {})
 
@@ -267,6 +301,7 @@ class PublishedKVInfo(PublishedInfo):
 class AllocResult:
     success: bool = True
     error: AdmitFailedReason | None = None
+    new_pages: list[int] | None = None
 
 
 @dataclass
@@ -292,6 +327,55 @@ class KVPlanState:
         self.total_tokens = n
 
 
+class _LabelRows:
+    """One plan label's real rows of a cached decode plan, derived from the
+    full plan's views at the first hit: streams, lengths, page lists and the
+    numpy index arrays FlashInfer takes. Padding rows are not here; they are
+    rebuilt per step from the step's own padding segments (same layout, other
+    dummy ids)."""
+
+    __slots__ = (
+        "rows", "streams", "lens", "npages", "row_pages", "last_page",
+        "indices", "gens", "n_pad", "pad_span", "pad_pages", "built",
+    )
+
+    def __init__(self, **kw):
+        for k in self.__slots__:
+            setattr(self, k, kw[k])
+
+
+class _DecodePlanCache:
+    """The last leased decode plan, as `_fast_decode_plan` continues it."""
+
+    __slots__ = (
+        "step_segments", "real_segments", "n_real", "pad_layout", "views", "epoch", "pending", "derived", "_rows",
+    )
+
+    def __init__(self, step_segments, real_segments, n_real, pad_layout, views, epoch):
+        # the planned step's own segments tuple: a commit of that object is the
+        # one commit the next plan may assume
+        self.step_segments = step_segments
+        # the real rows' segments, the key the next step must match
+        self.real_segments = real_segments
+        self.n_real = n_real
+        # (count, span) of the padding rows, which change dummy ids per slot
+        self.pad_layout = pad_layout
+        # the full plan's views per label, the source of `derived`
+        self.views = views
+        self.epoch = epoch
+        self.pending = 0
+        self.derived: dict | None = None
+        self._rows = None
+
+    @property
+    def rows(self) -> frozenset:
+        """The real (request, label) pairs, for the commit check of a step
+        that is not the cached batch."""
+        if self._rows is None:
+            self._rows = frozenset(seg[:2] for seg in self.real_segments)
+        return self._rows
+
+
 class KVManager(AttentionResource):
     prefix_skip_safe = True
 
@@ -303,6 +387,7 @@ class KVManager(AttentionResource):
         transfer_engine_info: TransferEngineInfo,
         device: torch.device,
         dtype=torch.bfloat16,
+        needs_remote_transfer: bool = False,
     ):
         self.config = cfg
         if joint_comm_group is not None:
@@ -321,7 +406,10 @@ class KVManager(AttentionResource):
         sink = self._arena.acquire(1)
         assert sink == [SINK_PAGE], f"expected page {SINK_PAGE} first, got {sink}"
         self._transfer = KVTransferManager(
-            transfer_engine_info, self.kv_cache
+            transfer_engine_info,
+            self.kv_cache,
+            resource_key=name,
+            needs_remote_transfer=needs_remote_transfer,
         )
         self._cpu_pool: CPUPagePool | None = None
         if cfg.cpu_offload_pages > 0:
@@ -331,6 +419,19 @@ class KVManager(AttentionResource):
             )
         self._streams: dict[str, LabelToStream] = {}
         self._overrides: dict[str, KVReqConfig] = {}
+        # (node, walk) -> (label, stop buffer name) per request, for the
+        # decode-step chain extension; dropped with the request
+        self._chain_lookup: dict[str, dict[tuple[str, str], tuple]] = {}
+        # decode steps of sampled tokens waiting to extend the chains (lazy)
+        self._chain_backlog: list[tuple] = []
+        self._chain_lazy_steps = kv_chain_lazy_steps()
+        # steps waiting per request, and the widest row among them: a
+        # commit tolerates a chain that lags by that many tokens
+        self._chain_pending: Counter = Counter()
+        self._chain_backlog_width = 0
+        # requests whose waiting tokens went out early (a removal): the next
+        # flush leaves them out
+        self._chain_drained: set[str] = set()
         # its entity id is the worker id, and one worker is one copy of a node
         self._replica = (
             transfer_engine_info.my_entity_id
@@ -350,7 +451,19 @@ class KVManager(AttentionResource):
 
         # (slot, label) -> KVPlanState, sized for the largest capture bucket
         self._static_plan_states: dict[tuple[int, str], KVPlanState] = {}
+        # copy-only H2D into those, see `_stage_decode_plan_state`
+        self._plan_stager = PinnedStager(torch.long)
         self._cg_max_seq_len = 0
+        # the plan cache (`_fast_decode_plan`): bumped by everything that
+        # changes a stream's pages or length other than a step's commit
+        self._plan_epoch = 0
+        self._decode_plan_cache: _DecodePlanCache | None = None
+        self._plan_cache_mode = kv_plan_cache()
+        # FlashInfer's index arrays from page-locked memory (see PinnedIndexRing)
+        self._indptr_ring = (
+            PinnedIndexRing() if kv_pinned_indptrs() and torch.cuda.is_available() else None
+        )
+        self.plan_cache_stats = {"hit": 0, "miss": 0, "mismatch": 0}
         self._current_plan_states: dict[str, KVPlanState] = {}
         self.reset_default_cursors()
 
@@ -359,15 +472,23 @@ class KVManager(AttentionResource):
         self._preplan_key = None
         self._cached_plan_output: dict[str, KVPlanOutput] | None = None
 
-        # (rid, to_label, stored_len, generation) for pre-forks appliedb by
-        # a staged step; facilitates clear_preplan function
-        self._preplan_fork_undo: list[tuple[str, str, int, int]] = []
-        # (rid, to_label) for intialized reservations by staged step; cleared_preplan removes
-        # recorded in admit not plan, so separate from above.
+        # (rid, to_label) reservations a staged step made; clear_preplan
+        # releases them. recorded in admit, not plan: forks are not staged.
         self._preplan_new_labels: list[tuple[str, str]] = []
         # (rid, label) marked step_in_flight by a staged step, so an abandoned
         # one does not leave its streams unevictable
         self._preplan_marked: list[tuple[str, str]] = []
+
+        # (rid, label) -> pages the live reservation freshly acquired, for
+        # ``rollback_admit``. One record, not one per pass: only the plan thread
+        # or the GPU thread holds a reservation at a time, and the unwind has to
+        # find it whichever it was.
+        #
+        # Handle-keyed, so it MUST be purged when the handle is released: handles
+        # are recycled, and a stale entry would resolve against whichever request
+        # gets that handle next. ``admit`` clears the record, but a pre-planned
+        # step's admit returns first -- see ``remove_request`` / ``reset_request``.
+        self._admit_reserved_pages: dict[tuple[int, str], list[int]] = {}
 
     @classmethod
     def build(cls, spec: KVSpec, info: EngineResourceInfo):
@@ -378,6 +499,7 @@ class KVManager(AttentionResource):
             joint_comm_group=info.joint_comm_group,
             transfer_engine_info=info.transfer_engine_info,
             dtype=info.kv_dtype,
+            needs_remote_transfer=info.needs_remote_transfer,
         )
 
     def build_cuda_graph_buffers(
@@ -490,7 +612,7 @@ class KVManager(AttentionResource):
         if (
             self._index is None
             or ctx.capture
-            or segment.request_id not in ctx.request_ids
+            or not ctx.is_real_row(segment.request_id)
             or chain is None
         ):
             return
@@ -500,8 +622,13 @@ class KVManager(AttentionResource):
             stream.chain = None
             return
         # what was here before this write, not after: a decode step can commit
-        # before the token it writes is read back and counted
-        if stream.released or stream.stored_len - segment.span > chain.covered_len:
+        # before the token it writes is read back and counted. the lazy chain
+        # extension holds back a few steps more (`extend_prefix_chains_batch`)
+        lag = (
+            self._chain_pending.get(segment.request_id, 0) * self._chain_backlog_width
+            if self._chain_backlog else 0
+        )
+        if stream.released or stream.stored_len - segment.span > chain.covered_len + lag:
             stream.chain = None
             return
         filled = chain.pages_filled(stream.stored_len, self.config.page_size)
@@ -555,6 +682,7 @@ class KVManager(AttentionResource):
         leased: the read is issued under this same lock, so nothing can come
         between the two.
         """
+        self._touch_plan_cache()
         if (
             self._index is None
             or not rooted
@@ -631,6 +759,10 @@ class KVManager(AttentionResource):
         tail = list((overrides.prefix_tail or {}).get(label) or ())
         stream.chain = PrefixChain.seed(keys, tail, self.config.page_size)
 
+    @property
+    def keys_prefix_chains(self) -> bool:
+        return self._index is not None
+
     def extend_prefix_chain(
         self, rid: str, node_name: str, graph_walk: str, outputs,
     ) -> None:
@@ -639,6 +771,7 @@ class KVManager(AttentionResource):
         The ids come from the stop check's host copy, which can land after their
         step commits, so a later commit indexes the page.
         """
+        self.flush_chain_backlog()
         with self._lock:
             label = self._keyed_label(rid, node_name, graph_walk)
             if label is None:
@@ -657,6 +790,205 @@ class KVManager(AttentionResource):
                 return
             stream.chain.extend(sampled[0].flatten().tolist(), self.config.page_size)
 
+    def extend_prefix_chains_batch(
+        self, request_ids: list[str], node_name: str, graph_walk: str,
+        host_rows,
+    ) -> None:
+        """``extend_prefix_chain`` for a step, from the stop check's row
+        buffers (``HostRows``: row i of every buffer belongs to
+        ``host_rows.request_ids[i]``).
+
+        Lazy by default: the step's rows are copied aside and the chains are
+        extended once every ``MSTAR_KV_CHAIN_LAZY_STEPS`` steps, one extend per
+        request with all its tokens since the last flush, so the per-row Python
+        runs once per batch of steps instead of every step. A key can thus
+        appear a few steps late and is indexed by a later commit, as the
+        single-request path allows. Removals and resets flush first."""
+        if self._chain_lazy_steps <= 1:
+            self._extend_chains_eager(request_ids, node_name, graph_walk, host_rows)
+            return
+        step = (
+            tuple(host_rows.request_ids), node_name, graph_walk, tuple(request_ids),
+            {
+                name: buf.reshape(buf.shape[0], -1).cpu().numpy().copy()
+                for name, buf in host_rows.buffers.items()
+                if torch.is_tensor(buf) and buf.dim() != 0
+            },
+        )
+        width = max((a.shape[1] for a in step[4].values()), default=0)
+        with self._lock:
+            self._chain_backlog.append(step)
+            self._chain_pending.update(step[0])
+            self._chain_backlog_width = max(self._chain_backlog_width, width)
+            if len(self._chain_backlog) >= self._chain_lazy_steps:
+                self.flush_chain_backlog()
+
+    def _extend_chains_eager(
+        self, request_ids: list[str], node_name: str, graph_walk: str,
+        host_rows,
+    ) -> None:
+        """The per-step extension (MSTAR_KV_CHAIN_LAZY_STEPS=1): one lock,
+        one ``tolist`` per buffer instead of one per request. The round-2
+        body, kept as it was: at c32 the step is GIL-bound and even the
+        few extra numpy calls of the lazy path's bookkeeping showed."""
+        row_of = {rid: i for i, rid in enumerate(host_rows.request_ids)}
+        buffers = host_rows.buffers
+        rows_of: dict[str, list] = {}
+        page_size = self.config.page_size
+        key = (node_name, graph_walk)
+        lookup = self._chain_lookup
+        with self._lock:
+            for rid in request_ids:
+                # the label and buffer name do not change over a request's
+                # life (its overrides are set at ingest), so each is looked up
+                # once instead of on every decode step
+                per_rid = lookup.get(rid)
+                if per_rid is None:
+                    per_rid = lookup[rid] = {}
+                entry = per_rid.get(key)
+                if entry is None:
+                    label = self._keyed_label(rid, node_name, graph_walk)
+                    tensor = (
+                        (self._overrides[rid].prefix_decode or {}).get(label)
+                        if label is not None else None
+                    )
+                    entry = per_rid[key] = (label, tensor)
+                label, tensor = entry
+                if label is None or not tensor:
+                    continue
+                rows = rows_of.get(tensor)
+                if rows is None:
+                    buf = buffers.get(tensor)
+                    if not torch.is_tensor(buf) or buf.dim() == 0:
+                        continue
+                    rows = rows_of[tensor] = buf.reshape(buf.shape[0], -1).tolist()
+                i = row_of.get(rid)
+                if i is None or i >= len(rows):
+                    continue
+                stream = self._streams.get(rid, {}).get(label)
+                if stream is None or stream.chain is None or stream.chain.unkeyed is None:
+                    continue
+                if stream.released:
+                    stream.chain = None
+                    continue
+                stream.chain.extend(rows[i], page_size)
+
+    def flush_chain_backlog(self) -> None:
+        """Extend the chains with every step waiting in the backlog."""
+        if not self._chain_backlog:
+            return
+        with self._lock:
+            # the swap under the lock, so two flushing threads (the stop check
+            # and a removal) cannot both take the same steps
+            steps, self._chain_backlog = self._chain_backlog, []
+            self._chain_pending = Counter()
+            self._chain_backlog_width = 0
+            drained, self._chain_drained = self._chain_drained, set()
+            # runs of steps with the same rows and batch go out as one extend
+            # per request; a change of batch composition starts a new run
+            run: list = []
+            for st in steps:
+                if run and run[0][:4] != st[:4]:
+                    self._extend_chains_from(run, drained)
+                    run = []
+                run.append(st)
+            if run:
+                self._extend_chains_from(run, drained)
+
+    def _drain_chain_backlog(self, rid: str) -> None:
+        """Under the lock: extend one request's chain with its tokens waiting
+        in the backlog, and leave them out of the next flush. A removal does
+        this instead of a flush, which at high concurrency would come every
+        step or two."""
+        if not self._chain_backlog or rid in self._chain_drained:
+            return
+        self._chain_drained.add(rid)
+        self._chain_pending.pop(rid, None)
+        parts: list[tuple] = []
+        for st in self._chain_backlog:
+            try:
+                i = st[0].index(rid)
+            except ValueError:
+                continue
+            if rid in st[3]:
+                parts.append((st, i))
+        if not parts:
+            return
+        st0 = parts[0][0]
+        entry = self._chain_lookup.get(rid, {}).get((st0[1], st0[2]))
+        if entry is None:
+            label = self._keyed_label(rid, st0[1], st0[2])
+            tensor = (
+                (self._overrides[rid].prefix_decode or {}).get(label)
+                if label is not None else None
+            )
+        else:
+            label, tensor = entry
+        if label is None or not tensor:
+            return
+        stream = self._streams.get(rid, {}).get(label)
+        if stream is None or stream.chain is None or stream.chain.unkeyed is None:
+            return
+        if stream.released:
+            stream.chain = None
+            return
+        tokens: list[int] = []
+        for st, i in parts:
+            arr = st[4].get(tensor)
+            if arr is not None and i < arr.shape[0]:
+                tokens.extend(arr[i].tolist())
+        if tokens:
+            stream.chain.extend(tokens, self.config.page_size)
+
+    def _extend_chains_from(self, steps: list, drained: set[str] = frozenset()) -> None:
+        """Under the lock: one extend per request with the tokens of
+        ``steps`` (same rows and batch) in step order."""
+        rows, node_name, graph_walk, request_ids, _ = steps[0]
+        row_of = {rid: i for i, rid in enumerate(rows)}
+        page_size = self.config.page_size
+        key = (node_name, graph_walk)
+        lookup = self._chain_lookup
+        cols: dict[str, object] = {}
+        for rid in request_ids:
+            if rid in drained:
+                continue
+            # the label and buffer name do not change over a request's
+            # life (its overrides are set at ingest), so each is looked up
+            # once instead of on every decode step
+            per_rid = lookup.get(rid)
+            if per_rid is None:
+                per_rid = lookup[rid] = {}
+            entry = per_rid.get(key)
+            if entry is None:
+                label = self._keyed_label(rid, node_name, graph_walk)
+                tensor = (
+                    (self._overrides[rid].prefix_decode or {}).get(label)
+                    if label is not None else None
+                )
+                entry = per_rid[key] = (label, tensor)
+            label, tensor = entry
+            if label is None or not tensor:
+                continue
+            i = row_of.get(rid)
+            if i is None:
+                continue
+            col = cols.get(tensor)
+            if col is None:
+                parts = [st[4][tensor] for st in steps if tensor in st[4]]
+                if not parts or i >= parts[0].shape[0]:
+                    continue
+                # (steps * values per row) tokens for every row, in step order
+                col = cols[tensor] = np.concatenate(parts, axis=1)
+            if i >= col.shape[0]:
+                continue
+            stream = self._streams.get(rid, {}).get(label)
+            if stream is None or stream.chain is None or stream.chain.unkeyed is None:
+                continue
+            if stream.released:
+                stream.chain = None
+                continue
+            stream.chain.extend(col[i].tolist(), page_size)
+
     def _release_lease(self, stream: CacheStream) -> None:
         """Give back a lease `admit` never converted; a converted one is released
         with `page_indices`."""
@@ -672,6 +1004,10 @@ class KVManager(AttentionResource):
         )
 
     def ingest_request(self, rid, overrides: KVReqConfig | None=None):
+        self._touch_plan_cache(rid)
+        if rid in self._chain_drained:
+            # the handle comes back while steps under its old name still wait
+            self.flush_chain_backlog()
         if overrides is None:
             overrides = KVReqConfig()
         # guards `_streams`/`_overrides` against a concurrent admit/plan/commit
@@ -694,6 +1030,7 @@ class KVManager(AttentionResource):
         graph_walk: str,
         published: PublishedKVInfo | None
     ) -> AdmitOutcome:
+        self._touch_plan_cache(rid)
         if published is None:
             return ADMIT_OK
 
@@ -732,7 +1069,30 @@ class KVManager(AttentionResource):
                     return AdmitOutcome(ok=True, ready=False)
 
                 stream = self._ensure_label(rid, label)
-                own = seq_info.latest_kv_transfer_info == self._own_transfer_info()
+                own = self._transfer.owns_transfer_info(
+                    transfer_info=seq_info.latest_kv_transfer_info,
+                    request_id=rid,
+                    label=label,
+                )
+                remote_reset_generation = seq_info.reset_generation
+                if (
+                    not own
+                    and remote_reset_generation is not None
+                    and stream.remote_reset_generation is not None
+                    and remote_reset_generation
+                    != stream.remote_reset_generation
+                ):
+                    # The producer rewound/replaced this logical stream. Its
+                    # seq_len may be unchanged, so length alone cannot prove
+                    # the receiver still holds the published contents.
+                    self._release_lease(stream)
+                    drop = self._arena.any_sealed(stream.page_indices)
+                    if drop:
+                        self._arena.release(stream.page_indices)
+                    stream.reset(freed=drop)
+                    stream.forget_chain()
+                if not own and remote_reset_generation is not None:
+                    stream.remote_reset_generation = remote_reset_generation
                 if not own and stream.chain is not None:
                     # another rank sampled the token after this record, so the pending tail is one behind
                     stream.chain.unkeyed = None
@@ -779,18 +1139,28 @@ class KVManager(AttentionResource):
     def admit(self, step: KVStep, ctx: StepContext) -> AdmitOutcome:
         if self._preplanned and not ctx.is_preplan:
             if self._preplan_key == self._plan_key(step, ctx):
-                # pages were already reserved by the preplan pass
+                # pages were already reserved by the preplan pass — and the record
+                # of them has to survive this call, because it is what a refusal
+                # further down the resource order unwinds. Falling through to the
+                # clear below would leak them.
                 return ADMIT_OK
             # a different step arrived first (see `plan`): drop the staged
             # plan and reserve for this step normally. The staged step's own
             # span pages stay with its stream, where its re-admit finds them.
+            # Its reservation went with ``clear_preplan``, so the record of it is
+            # stale and the clear below is right for this path.
             self.clear_preplan()
+        with self._lock:
+            self._admit_reserved_pages.clear()
         # forks reserve here and copy later (plan for pre-, commit for post-),
         # so a step that never runs leaves pages resident but no page contents
         # moved — re-admitting it allocates nothing and re-copies nothing.
         # A post-fork copies the source *after* this step's spans land, so its
         # reservation covers them.
-        growth = self._label_growth(step) if step.commit else {}
+        # only a post-fork reads the growth, so a decode step does not build it
+        growth = (
+            self._label_growth(step) if step.commit and step.post_forks else {}
+        )
         forks = [(pre, 0) for pre in step.pre_forks] + [
             (post, growth) for post in step.post_forks
         ]
@@ -813,6 +1183,7 @@ class KVManager(AttentionResource):
                 ):
                     # drop the empty pages a refused batch admit left, before taking the lease
                     self._arena.release(stream.page_indices)
+                    self._plan_epoch += 1
                     stream.page_indices = list(stream.lease)
                     stream.stored_len = (
                         len(stream.lease) * self.config.page_size
@@ -830,6 +1201,8 @@ class KVManager(AttentionResource):
                 self._preplan_marked = []
             for (from_label, to_label), extra in forks:
                 for rid in ctx.padded_request_ids:
+                    if ctx.is_padding_row(rid):
+                        continue
                     # checked before the reservation, which is what creates it
                     if (
                         ctx.is_preplan
@@ -842,18 +1215,35 @@ class KVManager(AttentionResource):
                     )
                     if not alloc_res.success:
                         return AdmitOutcome(ok=False, reason=alloc_res.error)
+                    if alloc_res.new_pages:
+                        self._admit_reserved_pages.setdefault(
+                            (rid, to_label), []).extend(alloc_res.new_pages)
 
+            page_size = self.config.page_size
             for segment in step.segments:
-                if segment.span == 0:
+                # A replay's padding rows reserve nothing: they run against
+                # SINK_PAGE (see `_sequence_views`). Pages for them would fail
+                # to allocate on a near-full arena and hold the batch.
+                if segment.span == 0 or ctx.is_padding_row(segment.request_id):
                     continue
                 stream = self._ensure_label(segment.request_id, segment.label)
+                seq_len = segment.span + stream.stored_len
+                # the common decode row: its pages already cover the token it
+                # appends, so there is nothing to acquire and nothing to record
+                if (
+                    not stream.offloaded
+                    and len(stream.page_indices) * page_size >= seq_len
+                ):
+                    continue
                 alloc_res = self._alloc(
-                    segment.request_id,
-                    segment.label,
-                    segment.span + stream.stored_len
+                    segment.request_id, segment.label, seq_len,
                 )
                 if not alloc_res.success:
                     return AdmitOutcome(ok=False, reason=alloc_res.error)
+                if alloc_res.new_pages:
+                    self._admit_reserved_pages.setdefault(
+                        (segment.request_id, segment.label), []
+                    ).extend(alloc_res.new_pages)
 
             # marked here rather than in plan so the mark also covers
             # admit -> plan, where an offload would otherwise release pages
@@ -862,6 +1252,8 @@ class KVManager(AttentionResource):
             # `.get` because a zero-span segment on a label nothing created
             # reserves no stream (see the loop above)
             for segment in step.segments:
+                if ctx.is_padding_row(segment.request_id):
+                    continue
                 stream = self._streams.get(
                     segment.request_id, {}
                 ).get(segment.label)
@@ -878,23 +1270,82 @@ class KVManager(AttentionResource):
 
         return ADMIT_OK
 
-    def _sequence_views(self, segments: list[Segment]) -> list[SequenceView]:
+    def rollback_admit(self, step: KVStep, ctx: StepContext) -> None:
+        """Give back the pages this admit freshly acquired. Does not touch pages
+        retained by a shared prefix or a lease converted onto the stream.
+
+        ``page_indices`` maps token position to page, so the reserved pages can
+        only be dropped off the tail. If something else has extended the stream
+        since, the tail can no longer be safely removed.
+        """
+        self._touch_plan_cache()
+        del step, ctx
+        with self._lock:
+            reserved, self._admit_reserved_pages = self._admit_reserved_pages, {}
+            for (rid, label), pages in reserved.items():
+                if not pages:
+                    continue  # `page_indices[:-0]` would empty the whole stream
+                stream = self._streams.get(rid, {}).get(label)
+                if stream is None:
+                    continue  # reset or removed under us; its pages went with it
+                if stream.page_indices[-len(pages):] != pages:
+                    logger.error(
+                        "KV %s: cannot unwind %s/%s's admit — its pages are no "
+                        "longer the tail of the stream (%d reserved, stream has "
+                        "%d). Leaving them; the free pool is short by that much.",
+                        self.name, rid, label, len(pages),
+                        len(stream.page_indices),
+                    )
+                    continue
+                self._arena.release(pages)
+                del stream.page_indices[-len(pages):]
+                # so an offload that claimed this stream mid-admit notices its
+                # host copy no longer describes it and aborts
+                stream.generation += 1
+            if _DEBUG_ASSERTS:
+                self.assert_pages_conserved()
+
+    def _forget_reservations(self, rid: int) -> None:
+        """Drop ``rid``'s unwind record. Caller holds the lock."""
+        for key in [k for k in self._admit_reserved_pages if k[0] == rid]:
+            del self._admit_reserved_pages[key]
+
+    def _sequence_views(
+        self,
+        segments: list[Segment],
+        pending_forks: dict[tuple[str, str], tuple[int, int]] | None = None,
+        ctx: StepContext | None = None,
+    ) -> list[SequenceView]:
         views = []
         page_size = self.kv_cache.page_size
+        pending_forks = pending_forks or {}
         for s in segments:
+            if ctx is not None and ctx.is_padding_row(s.request_id):
+                # A padding row reads and writes SINK_PAGE; the engine
+                # discards its output.
+                views.append(SequenceView(
+                    request_id=s.request_id, label=s.label,
+                    # a sink page per page of span, not one: fewer and its writes spill into the previous row's pages
+                    page_idxs=[SINK_PAGE] * -(-s.span // page_size),
+                    length=s.span, to_compute=s.span,
+                ))
+                continue
             stream = self._streams[s.request_id][s.label]
+            stored_len, generation = pending_forks.get(
+                (s.request_id, s.label), (stream.stored_len, stream.generation)
+            )
             # `page_indices` is a high-water mark, so a stream can hold more
             # pages than its tokens need (a refused admit, a reset that kept
             # its pages). slice to the length or the view addresses token 0
             # into the wrong page and reports the padding as resident context
-            length = s.span + stream.stored_len
+            length = s.span + stored_len
             num_pages = -(-length // page_size)
             views.append(SequenceView(
                 request_id=s.request_id,
                 label=s.label, page_idxs=stream.page_indices[:num_pages],
                 length=length,
                 to_compute=s.span,
-                generation=stream.generation,
+                generation=generation,
             ))
         return views
 
@@ -955,15 +1406,7 @@ class KVManager(AttentionResource):
         stream, so build it in the same CPU pass the views came from and send
         it over as one H2D.
         """
-        page_size = self.kv_cache.page_size
-        pages: list[int] = []
-        offsets: list[int] = []
-        for view in views:
-            # off the stream's page count, not its logical length: that is what
-            # `build_paged_indptrs` hands attention, so a stream holding more
-            # pages than its length needs stays self-consistent
-            pages.append(view.page_idxs[-1])
-            offsets.append((view.last_page_len(page_size) or page_size) - 1)
+        pages, offsets = self._decode_locations(views)
         locations = torch.tensor(
             [pages, offsets], dtype=torch.long
         ).to(self._device, non_blocking=True)
@@ -973,11 +1416,59 @@ class KVManager(AttentionResource):
             total_tokens=len(views),
         )
 
+    def _decode_locations(
+        self, views: list[SequenceView],
+    ) -> tuple[list[int], list[int]]:
+        """Each decode row's (page, offset-in-page) for the token it writes.
+
+        Off the stream's page count, not its logical length: that is what
+        `build_paged_indptrs` hands attention, so a stream holding more pages
+        than its length needs stays self-consistent."""
+        page_size = self.kv_cache.page_size
+        pages = [view.page_idxs[-1] for view in views]
+        offsets = [(view.last_page_len(page_size) or page_size) - 1 for view in views]
+        return pages, offsets
+
+    def _stage_decode_plan_state(
+        self, views: list[SequenceView] | None, static_state: KVPlanState,
+        capture_len: int, pages=None, offsets=None,
+    ) -> KVPlanState:
+        """``_decode_plan_state`` + ``KVPlanState.copy_`` with no device staging
+        tensor; rows past the real tokens get SINK_PAGE / 0."""
+        if pages is None or offsets is None:
+            pages, offsets = self._decode_locations(views)
+        self._plan_stager.copy_(
+            static_state.token_to_page[:capture_len], pages, pad_value=SINK_PAGE,
+        )
+        self._plan_stager.copy_(
+            static_state.token_to_cache[:capture_len], offsets, pad_value=0,
+        )
+        static_state.total_tokens = len(pages)
+        return static_state
+
     def _setup_plan_states(
         self, plan_output: dict[str, KVPlanOutput],
         ctx: StepContext, lease,
     ):
         for label, indptrs in plan_output.items():
+            if indptrs.is_decode and lease is not None:
+                # Straight into the captured buffers in one H2D per buffer:
+                # this runs in the pre-plan beside a live graph, where a
+                # device-side copy + fill would slow it (see mstar.utils.h2d).
+                # a cached plan hands its locations; reading `views` there
+                # would build them eagerly and defeat the lazy builder
+                cached = indptrs.decode_pages is not None
+                plan_state = self._stage_decode_plan_state(
+                    None if cached else indptrs.views,
+                    self._static_plan_state(lease.slot, label),
+                    lease.bucket.num_tokens,
+                    pages=indptrs.decode_pages, offsets=indptrs.decode_offsets,
+                )
+                if ctx.is_preplan:
+                    self._preplan_states[label] = plan_state
+                else:
+                    self._current_plan_states[label] = plan_state
+                continue
             if indptrs.is_decode:
                 plan_state = self._decode_plan_state(indptrs.views)
             else:
@@ -998,9 +1489,282 @@ class KVManager(AttentionResource):
 
     def _plan_output(self, views: list[SequenceView]) -> KVPlanOutput:
         return KVPlanOutput(
-            cpu_indptrs=build_paged_indptrs(views, self.kv_cache.page_size),
+            cpu_indptrs=build_paged_indptrs(
+                views, self.kv_cache.page_size, ring=self._indptr_ring,
+            ),
             views=views,
         )
+
+    def _touch_plan_cache(self, rid: str | None = None) -> None:
+        """A stream of ``rid`` (any stream, when None) changed other than by a
+        commit: the plan cache no longer describes the streams if it holds
+        that request."""
+        cache = self._decode_plan_cache
+        if cache is not None and (rid is None or any(rid == seg[0] for seg in cache.real_segments)):
+            self._plan_epoch += 1
+
+    def _split_padding(self, step: KVStep, ctx: StepContext):
+        """``(n_real, (n_pad, span))`` of a step whose real segments come
+        first and whose padding segments (a replay's dummy rows) all share
+        one span; None when the layout is anything else."""
+        segs = step.segments
+        n_real = 0
+        for seg in segs:
+            if not ctx.is_real_row(seg.request_id):
+                break
+            n_real += 1
+        pad = segs[n_real:]
+        if not pad:
+            return n_real, (0, 0)
+        span = pad[0].span
+        for seg in pad:
+            if seg.span != span or ctx.is_real_row(seg.request_id):
+                return None
+        return n_real, (len(pad), span)
+
+    def _remember_decode_plan(
+        self, step: KVStep, ctx: StepContext, res: "KVPlanOutputs",
+    ) -> None:
+        """Keep a leased decode step's plan so the next step of the same rows
+        can be planned off it (`_fast_decode_plan`). O(1): the full plan's
+        views are kept as they are and the per-row arrays are derived at the
+        first hit. Any other plan leaves the cache alone; the epoch and the
+        commit bookkeeping say whether it still describes the streams."""
+        lease = ctx.slot_lease
+        if lease is None or ctx.capture or step.pre_forks or step.post_forks:
+            return
+        split = self._split_padding(step, ctx)
+        if split is None:
+            return
+        n_real, pad_layout = split
+        for seg in step.segments:
+            if seg.span != 1:
+                return
+        self._decode_plan_cache = _DecodePlanCache(
+            step_segments=step.segments, real_segments=step.segments[:n_real],
+            n_real=n_real, pad_layout=pad_layout,
+            views={label: out.views for label, out in res.items()},
+            epoch=self._plan_epoch,
+        )
+
+    def _derive_rows(self, cache: _DecodePlanCache, ctx: StepContext) -> dict | None:
+        """The per-label row arrays of a cached plan, from its views (once,
+        at the first hit)."""
+        page_size = self.kv_cache.page_size
+        derived: dict[str, _LabelRows] = {}
+        for label, views in cache.views.items():
+            n_real = 0
+            for v in views:
+                if not ctx.is_real_row(v.request_id) and v.request_id not in self._streams:
+                    break
+                if not any(v.request_id == seg[0] and v.label == seg[1] for seg in cache.real_segments):
+                    break
+                n_real += 1
+            real, pad = views[:n_real], views[n_real:]
+            if pad and (len(pad), pad[0].to_compute) != cache.pad_layout:
+                return None
+            streams = []
+            for v in real:
+                stream = self._streams.get(v.request_id, {}).get(v.label)
+                if stream is None or len(v.page_idxs) != -(-v.length // page_size):
+                    return None
+                streams.append(stream)
+            row_pages = [v.page_idxs for v in real]
+            derived[label] = _LabelRows(
+                rows=tuple((v.request_id, v.label, 1) for v in real),
+                streams=streams,
+                lens=np.fromiter((v.length for v in real), np.int64, n_real),
+                npages=np.fromiter((len(p) for p in row_pages), np.int64, n_real),
+                row_pages=row_pages,
+                last_page=np.fromiter((p[-1] for p in row_pages), np.int64, n_real),
+                indices=np.fromiter(
+                    itertools.chain.from_iterable(row_pages), np.int32, sum(len(p) for p in row_pages),
+                ),
+                gens=np.fromiter((v.generation for v in real), np.int64, n_real),
+                n_pad=len(pad), pad_span=pad[0].to_compute if pad else 0,
+                pad_pages=len(pad[0].page_idxs) if pad else 0,
+                built=None,
+            )
+        return derived
+
+    def _fast_decode_plan(
+        self, step: KVStep, ctx: StepContext,
+    ) -> "KVPlanOutputs | None":
+        """The plan of a leased decode step off the previous step's, when the
+        real rows are the same in the same order and only that step's commit
+        touched the streams (`_plan_epoch`, `pending`): every length is one
+        more, a page is new only where a row crossed a page boundary, the
+        index arrays come from numpy and the views are built only if a
+        consumer asks. None means plan from the streams."""
+        cache = self._decode_plan_cache
+        stats = self.plan_cache_stats
+        if (
+            cache is None
+            or ctx.slot_lease is None
+            or ctx.capture
+            or step.pre_forks
+            or step.post_forks
+        ):
+            return None
+        if cache.epoch != self._plan_epoch or cache.pending != 1:
+            stats["miss"] += 1
+            return None
+        n_real = cache.n_real
+        segs = step.segments
+        if (
+            len(segs) != n_real + cache.pad_layout[0]
+            or segs[:n_real] != cache.real_segments
+            or any(seg.span != cache.pad_layout[1] or ctx.is_real_row(seg.request_id) for seg in segs[n_real:])
+        ):
+            stats["miss"] += 1
+            return None
+        if cache.derived is None:
+            cache.derived = self._derive_rows(cache, ctx)
+            if cache.derived is None:
+                self._decode_plan_cache = None
+                stats["miss"] += 1
+                return None
+        page_size = self.kv_cache.page_size
+        pad_segs = segs[n_real:]
+        make = self._indptr_ring.take if self._indptr_ring is not None else torch.from_numpy
+        out: dict[str, KVPlanOutput] = {}
+        for label, rows in cache.derived.items():
+            lens = rows.lens + 1
+            last = (lens - 1) % page_size + 1
+            npages = (lens + page_size - 1) // page_size
+            crossed = np.flatnonzero(npages != rows.npages)
+            # the one commit since bumped each row; a new page's alloc bumps it again
+            gens = rows.gens + 1
+            if crossed.size:
+                # copy only while the last plan's unbuilt views still hold the list
+                row_pages = rows.row_pages
+                if rows.built is not None and not rows.built[0]:
+                    row_pages = list(row_pages)
+                streams, last_page = rows.streams, rows.last_page
+                for i in crossed.tolist():
+                    want = int(npages[i])
+                    stream = streams[i]
+                    held = stream.page_indices
+                    if len(held) < want:
+                        stats["miss"] += 1
+                        return None
+                    pages = held[:want]
+                    row_pages[i] = pages
+                    last_page[i] = pages[-1]
+                    gens[i] = stream.generation
+                rows.row_pages = row_pages
+                rows.indices = np.fromiter(
+                    itertools.chain.from_iterable(row_pages), np.int32, int(npages.sum()),
+                )
+            rows.lens = lens
+            rows.npages = npages
+            rows.gens = gens
+            n_pad, pad_span, pad_pages = rows.n_pad, rows.pad_span, rows.pad_pages
+            if n_pad:
+                pad_last = (pad_span - 1) % page_size + 1
+                last_all = np.concatenate((last, np.full(n_pad, pad_last, np.int64)))
+                npages_all = np.concatenate((npages, np.full(n_pad, pad_pages, np.int64)))
+                indices = np.concatenate((rows.indices, np.full(n_pad * pad_pages, SINK_PAGE, np.int32)))
+                pages_all = np.concatenate((rows.last_page, np.full(n_pad, SINK_PAGE, np.int64)))
+            else:
+                last_all, npages_all, indices, pages_all = last, npages, rows.indices, rows.last_page.copy()
+            kv_indptr = np.concatenate((np.zeros(1, np.int64), np.cumsum(npages_all))).astype(np.int32)
+            n_rows = n_real + n_pad
+            qo_indptr = np.arange(n_rows + 1, dtype=np.int32)
+            kv_lens = (npages_all - 1) * page_size + last_all
+            row_pages_now, lens_now = rows.row_pages, lens.tolist()
+            pad_now = [(seg.request_id, seg.label, seg.span) for seg in pad_segs]
+            rows.built = built = [False]
+
+            def build_views(
+                row_pages_now=row_pages_now, lens_now=lens_now, gens_now=gens, pad_now=pad_now, rows=rows,
+                built=built,
+            ):
+                built[0] = True
+                # generations as of this plan, not read off the streams a later commit bumps
+                views = [
+                    SequenceView(rid, lab, pages, length, 1, 0, gen)
+                    for (rid, lab, _), pages, length, gen in zip(
+                        rows.rows, row_pages_now, lens_now, gens_now.tolist(), strict=True,
+                    )
+                ]
+                views.extend(
+                    SequenceView(rid, lab, [SINK_PAGE] * rows.pad_pages, span, span) for rid, lab, span in pad_now
+                )
+                return views
+
+            out[label] = KVPlanOutput(
+                cpu_indptrs=PagedIndptrs(
+                    qo_indptr=make(qo_indptr),
+                    paged_kv_indptr=make(kv_indptr),
+                    paged_kv_indices=make(indices),
+                    paged_kv_last_page_len=make(last_all.astype(np.int32)),
+                    kv_lens=torch.from_numpy(kv_lens.astype(np.int32)).as_subclass(HostLens),
+                ),
+                decode_pages=pages_all,
+                decode_offsets=last_all - 1,
+                rows=rows.rows + tuple(pad_now),
+                view_builder=build_views,
+            )
+        cache.step_segments = step.segments
+        cache.pending = 0
+        stats["hit"] += 1
+        return KVPlanOutputs(out, pre_forks=step.pre_forks, post_forks=step.post_forks)
+
+    @staticmethod
+    def _same_plan(a: "KVPlanOutputs", b: "KVPlanOutputs") -> bool:
+        """The cached plan against the full one (MSTAR_KV_PLAN_CACHE=2)."""
+        if a.keys() != b.keys():
+            return False
+        for label, x in a.items():
+            y = b[label]
+            if len(x.views) != len(y.views):
+                return False
+            for u, v in zip(x.views, y.views, strict=True):
+                if u[:5] != v[:5] or u.generation != v.generation:
+                    return False
+            for p, q in zip(x.cpu_indptrs[:5], y.cpu_indptrs[:5], strict=True):
+                if (p is None) != (q is None) or (
+                    p is not None and not torch.equal(p, q)
+                ):
+                    return False
+            if x.decode_pages is not None:
+                pages = [v.page_idxs[-1] for v in y.views]
+                if x.decode_pages.tolist() != pages:
+                    return False
+        return True
+
+    def _maybe_apply_forks(self, step: KVStep, ctx: StepContext):
+        for (from_label, to_label) in step.pre_forks:
+            for rid in ctx.padded_request_ids:
+                if ctx.is_padding_row(rid):
+                    continue
+                self._apply_fork(rid, from_label, to_label)
+
+    def _pending_fork_state(
+        self, step: KVStep, ctx: StepContext
+    ) -> dict[tuple[str, str], tuple[int, int]]:
+        """``(stored_len, generation)`` each pre-fork will hand its target.
+
+        Staging cannot run the fork (`copy_pages` would race the default
+        stream), so the target's length and bumped generation are read ahead
+        and the copy happens at promotion.
+        """
+        pending: dict[tuple[str, str], tuple[int, int]] = {}
+        with self._lock:
+            for (from_label, to_label) in step.pre_forks:
+                for rid in ctx.padded_request_ids:
+                    if ctx.is_padding_row(rid):
+                        continue
+                    labels = self._streams.get(rid, {})
+                    src = labels.get(from_label)
+                    dst = labels.get(to_label)
+                    if src is None or dst is None:
+                        continue
+                    pending[(rid, to_label)] = (
+                        src.stored_len, dst.generation + 1,
+                    )
+        return pending
 
     def plan(self, step: KVStep, ctx: StepContext) -> dict[str, KVPlanOutput]:
         """
@@ -1015,30 +1779,58 @@ class KVManager(AttentionResource):
             if self._preplan_key == self._plan_key(step, ctx):
                 self._current_plan_states = self._preplan_states
                 res = self._cached_plan_output
-                self._preplan_fork_undo = []
+
+                # Promotion: apply the fork copies staging left undone; see
+                # `_pending_fork_state`.
+                self._maybe_apply_forks(step, ctx)
+
                 self._preplan_new_labels = []
                 self._preplan_marked = []
-                self.clear_preplan()
+                # the promoted step runs; the plan cache still describes it
+                self.clear_preplan(promoted=True)
                 return res
             # A different step reached the GPU thread before the one planned
             # ahead (e.g. a new request's prefill while a decode step sits
             # pre-planned): it must not be served the staged plan's pages.
             # Undo the staged plan's side effects and plan inline.
             self.clear_preplan()
-        undo = self._preplan_fork_undo if ctx.is_preplan else None
-        for (from_label, to_label) in step.pre_forks:
-            for rid in ctx.padded_request_ids:
-                self._apply_fork(rid, from_label, to_label, undo=undo)
-        res = KVPlanOutputs(
-            {
-                plan_label: self._plan_output(self._sequence_views(segments))
-                for plan_label, segments in group_by_plan_label(
-                    step.segments, step.combined_labels
-                ).items()
-            },
-            pre_forks=step.pre_forks,
-            post_forks=step.post_forks,
-        )
+
+        # Forks run ahead of the views, which record length and generation;
+        # staging only reads what the fork will land.
+        if ctx.is_preplan:
+            pending = self._pending_fork_state(step, ctx)
+        else:
+            pending = {}
+            self._maybe_apply_forks(step, ctx)
+
+        res = None
+        if self._plan_cache_mode and not pending:
+            res = self._fast_decode_plan(step, ctx)
+        if res is None or self._plan_cache_mode == 2:
+            full = KVPlanOutputs(
+                {
+                    plan_label: self._plan_output(
+                        self._sequence_views(segments, pending, ctx)
+                    )
+                    for plan_label, segments in group_by_plan_label(
+                        step.segments, step.combined_labels
+                    ).items()
+                },
+                pre_forks=step.pre_forks,
+                post_forks=step.post_forks,
+            )
+            if res is not None and not self._same_plan(res, full):
+                self.plan_cache_stats["mismatch"] += 1
+                logger.error(
+                    "KV %s: the plan cache disagrees with the full plan for "
+                    "%d segments; using the full plan (MSTAR_KV_PLAN_CACHE=2)",
+                    self.name, len(step.segments),
+                )
+                res = None
+            if res is None:
+                res = full
+                if self._plan_cache_mode and not pending:
+                    self._remember_decode_plan(step, ctx, res)
         self._setup_plan_states(res, ctx, ctx.slot_lease)
         if ctx.is_preplan:
             self._preplan_key = self._plan_key(step, ctx)
@@ -1057,19 +1849,13 @@ class KVManager(AttentionResource):
         lease = ctx.slot_lease
         return tuple(step.segments), (lease.slot if lease is not None else None)
 
-    def clear_preplan(self):
+    def clear_preplan(self, promoted: bool = False):
+        if not promoted:
+            self._touch_plan_cache()
         # the staged step is not going to run, so undo what it did to live
-        # state: dropping the cached plan is not enough, the pre-forks already
-        # copied pages and moved lengths
+        # state. the pre-forks need no rewinding — staging only read them —
+        # but admit's reservations are real pages and real streams
         with self._lock:
-            for rid, label, stored_len, generation in reversed(
-                self._preplan_fork_undo
-            ):
-                stream = self._streams.get(rid, {}).get(label)
-                if stream is not None:
-                    stream.stored_len = stored_len
-                    stream.generation = generation
-            self._preplan_fork_undo = []
             # labels the staged step invented are removed, not rewound to 0:
             # a stream at 0 that nothing asked for is still a stream, and it
             # holds the pages the reservation took
@@ -1090,10 +1876,32 @@ class KVManager(AttentionResource):
         self._cached_plan_output = None
 
     def commit(self, step: KVStep, ctx: StepContext):
+        streams = self._streams
+        retention = step.retention
+        # what the plan cache may assume of the next step: this step's spans
+        # landed, nothing else (a step that keeps no tokens is "something else")
+        cache = self._decode_plan_cache
+        if cache is not None:
+            if step.segments is cache.step_segments:
+                cache.pending += 1
+            elif len(step.segments) >= len(cache.step_segments) or any(
+                (seg.request_id, seg.label) in cache.rows for seg in step.segments
+            ):
+                # another batch that is as big (surely sharing rows) or that
+                # names a cached row: the cache no longer describes the streams
+                self._plan_epoch += 1
+        if not step.commit:
+            self._plan_epoch += 1
+        # the index only sees real rows of a non-capture step; checked once
+        index_on = self._index is not None and not ctx.capture
         # atomic against admit_retrieve reading stored_len on another thread
         with self._lock:
+            # committed, so there is nothing left to unwind
+            self._admit_reserved_pages.clear()
             for segment in step.segments:
-                stream = self._streams[segment.request_id][segment.label]
+                if ctx.is_padding_row(segment.request_id):
+                    continue  # ran against SINK_PAGE, holds nothing
+                stream = streams[segment.request_id][segment.label]
                 # cleared before the `step.commit` test: a step that keeps no
                 # tokens (image_gen, action_gen) still read these pages, and
                 # leaving the mark set would make the request unevictable
@@ -1109,14 +1917,19 @@ class KVManager(AttentionResource):
                             self.name, segment.span,
                             segment.request_id, segment.label,
                         )
+                        self._plan_epoch += 1
                         continue
                     stream.stored_len += segment.span
                     # committed, so there is no refused admit left for a re-probe to answer
                     stream.converted = False
-                    policy = step.retention.get((segment.request_id, segment.label))
+                    policy = (
+                        retention.get((segment.request_id, segment.label))
+                        if retention else None
+                    )
                     if policy is not None:
                         self._adopt_retention(stream, policy, segment)
-                    self._index_filled_pages(segment, stream, ctx)
+                    if index_on and stream.chain is not None:
+                        self._index_filled_pages(segment, stream, ctx)
                     # so a claim taken in a window the mark misses still fails
                     # `_commit_offload`'s generation guard
                     stream.generation += 1
@@ -1134,6 +1947,8 @@ class KVManager(AttentionResource):
             # spans above are counted
             for (from_label, to_label) in step.post_forks:
                 for rid in ctx.padded_request_ids:
+                    if ctx.is_padding_row(rid):
+                        continue
                     self._apply_fork(rid, from_label, to_label)
             if _DEBUG_ASSERTS:
                 self.assert_pages_conserved()
@@ -1208,6 +2023,7 @@ class KVManager(AttentionResource):
     def _release_oldest_locked(self, stream: CacheStream, num_tokens: int) -> int:
         """The page-floored front release shared by ``release_oldest`` and the
         commit-time retention. Under the lock."""
+        self._touch_plan_cache()
         page_size = self.config.page_size
         first = (stream.protected_prefix + page_size - 1) // page_size
         releasable = stream.stored_len // page_size - first
@@ -1373,6 +2189,7 @@ class KVManager(AttentionResource):
         have a torn host copy, and that fork's source is one of these streams,
         so the whole request stays on device rather than half of it.
         """
+        self._touch_plan_cache(rid)
         with self._lock:
             streams = self._streams.get(rid, {})
             for claim in moved:
@@ -1387,7 +2204,8 @@ class KVManager(AttentionResource):
                 freed += len(claim.pages)
                 self._arena.release(claim.pages)
                 stream.page_indices = []
-                stream.reset()
+                # Offload changes residency, not logical stream contents.
+                stream.reset(content_reset=False)
             return freed, {claim.label for claim in moved}
 
     def _abandon_claims(self, rid: str, labels: list[str]) -> None:
@@ -1416,17 +2234,33 @@ class KVManager(AttentionResource):
             request_id=rid,
         )
 
+    def _reload_pages_needed(self, rid: str) -> int:
+        return sum(
+            self._cpu_pool.num_pages(rid, label)
+            for label in self._cpu_pool.labels(rid)
+        )
+
+    def can_reload(self, rid: str) -> bool:
+        """Whether the free pages plus what the prefix index could evict cover
+        ``rid``'s offloaded streams. An upper bound: ``reload`` can still refuse."""
+        if self._cpu_pool is None or not self._cpu_pool.is_offloaded(rid):
+            return False
+        with self._lock:
+            evictable = 0 if self._index is None else self._index.num_sole_owned()
+            return self._reload_pages_needed(rid) <= self._arena.num_free + evictable
+
     def reload(self, rid: str) -> bool:
         """Bring every offloaded stream of ``rid`` back on device.
 
         False when the device can't fit them right now; nothing moves in that
         case, so the caller can evict further and try again.
         """
+        self._touch_plan_cache(rid)
         if self._cpu_pool is None or not self._cpu_pool.is_offloaded(rid):
             return False
         with self._lock:
             labels = self._cpu_pool.labels(rid)
-            needed = sum(self._cpu_pool.num_pages(rid, label) for label in labels)
+            needed = self._reload_pages_needed(rid)
             if needed > self._arena.num_free and self._index is not None:
                 # as `_alloc` does: once the pool is all cached pages, nothing
                 # else would ever free one for this request to come back to
@@ -1470,31 +2304,200 @@ class KVManager(AttentionResource):
         """Device pages the request is holding — the most reclaimable first."""
         return float(self.reclaimable(rid))
 
-    def _own_transfer_info(self):
+    def _own_transfer_info(
+        self,
+        request_id: str,
+        label: str,
+        stream: CacheStream,
+    ):
         """This cache's transfer descriptor, as `publish` stamps it."""
-        return self._transfer.get_kv_transfer_info()
+        return self._transfer.get_kv_transfer_info(
+            request_id=request_id,
+            label=label,
+            page_indices=stream.page_indices,
+            seq_len=stream.stored_len,
+            reset_generation=stream.reset_generation,
+        )
 
-    def publish(self, request_id: str):
-        # `remove_request` can pop the streams from another thread between the
-        # forward and finalize; nothing to publish then
-        streams = self._streams.get(request_id)
-        if streams is None:
-            return None
-
-        transfer_info = self._own_transfer_info()
+    def publish(
+        self,
+        request_id: str,
+        node_name: str | None = None,
+        graph_walk: str | None = None,
+        *,
+        final: bool = False,
+    ):
         with self._lock:
+            # remove_request can race finalize on another thread. Resolve the
+            # request and build its descriptor in this one critical section.
+            streams = self._streams.get(request_id)
+            overrides = self._overrides.get(request_id)
+            if streams is None or overrides is None:
+                return None
+            labels = overrides.get_publish_labels(
+                node_name, graph_walk, list(streams), final=final,
+            )
+            if not labels:
+                return None
             seq_info = {
                 label: KVSequenceInfo(
                     seq_len=stream.stored_len,
-                    latest_kv_transfer_info=transfer_info,
+                    latest_kv_transfer_info=self._own_transfer_info(
+                        request_id=request_id,
+                        label=label,
+                        stream=stream,
+                    ),
                     page_indices=list(stream.page_indices),
-                ) for label, stream in streams.items()
+                    reset_generation=stream.reset_generation,
+                ) for label in labels
+                if (stream := streams.get(label)) is not None
             }
+            if not seq_info:
+                return None
         return PublishedKVInfo.build_for_rank(
             rank=self._rank, world_size=self._world_size, seq_info=seq_info,
         )
 
+    def publish_for_step(
+        self,
+        request_id: str,
+        node_name: str | None,
+        graph_walk: str | None,
+    ):
+        return self.publish(
+            request_id, node_name=node_name, graph_walk=graph_walk,
+        )
+
+    def publish_snapshot_batch(
+        self,
+        request_ids: list[str],
+        node_name: str | None,
+        graph_walk: str | None,
+    ) -> list:
+        """``publish_snapshot_for_step`` for a batch: one lock acquisition and
+        a plain loop, which is what the gpu thread can afford per row."""
+        out = []
+        append = out.append
+        streams_of = self._streams.get
+        overrides_of = self._overrides.get
+        with self._lock:
+            for request_id in request_ids:
+                streams = streams_of(request_id)
+                overrides = overrides_of(request_id)
+                if streams is None or overrides is None:
+                    append(None)
+                    continue
+                labels = overrides.get_publish_labels(
+                    node_name, graph_walk, list(streams), final=False,
+                )
+                if not labels:
+                    append(None)
+                    continue
+                snap = []
+                for label in labels:
+                    stream = streams.get(label)
+                    if stream is not None:
+                        snap.append((
+                            label, stream.stored_len, len(stream.page_indices),
+                            stream.reset_generation,
+                        ))
+                append(tuple(snap) if snap else None)
+        return out
+
+    def publish_snapshot_for_step(
+        self,
+        request_id: str,
+        node_name: str | None,
+        graph_walk: str | None,
+    ):
+        """Per label the length, page count and generation ``publish`` would
+        export now. The page list itself is copied only when the publication
+        is finished, which in a steady decode loop is never: this ran for every
+        request on every step and was a quarter of the gpu thread's host time.
+        """
+        with self._lock:
+            streams = self._streams.get(request_id)
+            overrides = self._overrides.get(request_id)
+            if streams is None or overrides is None:
+                return None
+            labels = overrides.get_publish_labels(
+                node_name, graph_walk, list(streams), final=False,
+            )
+            if not labels:
+                return None
+            snap = tuple(
+                (label, stream.stored_len, len(stream.page_indices),
+                 stream.reset_generation)
+                for label in labels
+                if (stream := streams.get(label)) is not None
+            )
+        return snap or None
+
+    def publish_from_snapshot(
+        self,
+        request_id: str,
+        snapshot,
+        node_name: str | None,
+        graph_walk: str | None,
+    ):
+        """``publish`` as of the snapshot: the lengths are the snapshot's, so a
+        step that committed in between (the next one is already running when
+        the worker finishes a publication) does not leak into it. A commit
+        only appends pages, so the snapshot's page count still names the
+        pages it saw. A reset or a fork in between replaces the list (the
+        stream's ``reset_generation`` moves); the snapshot describes pages
+        that no longer exist then, and the stream is published as it stands."""
+        del node_name, graph_walk
+        if not snapshot:
+            return None
+        with self._lock:
+            streams = self._streams.get(request_id)
+            if streams is None:
+                return None
+            seq_info = {}
+            for label, seq_len, num_pages, reset_generation in snapshot:
+                stream = streams.get(label)
+                if stream is None:
+                    continue
+                if stream.reset_generation != reset_generation:
+                    seq_len = stream.stored_len
+                    num_pages = len(stream.page_indices)
+                    reset_generation = stream.reset_generation
+                pages = list(stream.page_indices[:num_pages])
+                seq_info[label] = KVSequenceInfo(
+                    seq_len=seq_len,
+                    latest_kv_transfer_info=self._transfer.get_kv_transfer_info(
+                        request_id=request_id,
+                        label=label,
+                        page_indices=pages,
+                        seq_len=seq_len,
+                        reset_generation=reset_generation,
+                    ),
+                    page_indices=pages,
+                    reset_generation=reset_generation,
+                )
+        if not seq_info:
+            return None
+        return PublishedKVInfo.build_for_rank(
+            rank=self._rank, world_size=self._world_size, seq_info=seq_info,
+        )
+
+    def publish_after_stop(
+        self,
+        request_id: str,
+        node_name: str | None,
+        graph_walk: str | None,
+    ):
+        return self.publish(
+            request_id,
+            node_name=node_name,
+            graph_walk=graph_walk,
+            final=True,
+        )
+
     def reset_request(self, rid: str, free: bool=False):
+        self._touch_plan_cache(rid)
+        self.flush_chain_backlog()
         streams = self._streams.get(rid)
         if streams is None:
             return
@@ -1518,12 +2521,18 @@ class KVManager(AttentionResource):
                 stream.reset(freed=drop)
                 # a stale cursor or generated key would misfile what the rerun writes
                 stream.forget_chain()
+            # the pages above were released, so any record of them is stale
+            self._forget_reservations(rid)
             for label, stream in self._streams.get(rid, {}).items():
                 self._seed_keys(rid, label, stream)
             if _DEBUG_ASSERTS:
                 self.assert_pages_conserved()
 
     def remove_request(self, rid: str):
+        self._touch_plan_cache(rid)
+        with self._lock:
+            # its waiting tokens first, before the handle can name another request
+            self._drain_chain_backlog(rid)
         streams = self._streams.get(rid)
         if streams is not None:
             # drain in-flight reads outside the lock; see reset_request
@@ -1537,8 +2546,13 @@ class KVManager(AttentionResource):
                     self._arena.release(stream.page_indices)
             if self._cpu_pool is not None:
                 self._cpu_pool.remove_request(rid)
+            # handle-keyed, and this releases the handle: a survivor would be
+            # unwound against whichever request is given this handle next
+            self._forget_reservations(rid)
             self._streams.pop(rid, None)
             self._overrides.pop(rid, None)
+            self._chain_lookup.pop(rid, None)
+            self._transfer.remove_request(rid)
             if _DEBUG_ASSERTS:
                 self.assert_pages_conserved()
 
@@ -1708,25 +2722,19 @@ class KVManager(AttentionResource):
         )
 
     def _apply_fork(
-        self, rid: str, from_label: str, to_label: str, undo: list | None = None,
+        self, rid: str, from_label: str, to_label: str,
     ) -> None:
         """Copy a stream onto its fork target, over pages `_reserve_fork` took.
 
         Locked (reentrant): called from plan (pre-forks, else unguarded) and
         from the already-locked commit (post-forks).
-
-        ``undo`` collects each target's prior ``(stored_len, generation)`` so a
-        preplan that is abandoned can be reversed; see `clear_preplan`.
         """
+        self._touch_plan_cache(rid)
         with self._lock:
             if from_label not in self._streams[rid]:
                 return
             from_stream = self._streams[rid][from_label]
             to_stream = self._ensure_label(rid, to_label)
-            if undo is not None:
-                undo.append(
-                    (rid, to_label, to_stream.stored_len, to_stream.generation)
-                )
             # sized off the source's length, not either side's page count:
             # both can hold more pages than the fork needs, and a target left
             # over-reserved by a refused admit used to make the copy lopsided
@@ -1750,6 +2758,7 @@ class KVManager(AttentionResource):
             )
             to_stream.stored_len = from_stream.stored_len
             to_stream.generation += 1
+            to_stream.reset_generation += 1
 
     def _alloc(
         self, request_id: str, label: str, seq_len: int
@@ -1765,6 +2774,9 @@ class KVManager(AttentionResource):
                 )
             num_pages_needed = (seq_len + self.config.page_size - 1) // self.config.page_size
             num_new_pages = num_pages_needed - len(stream.page_indices)
+            # a stream that already holds enough pages acquires none, and has
+            # nothing for ``rollback_admit`` to give back
+            new_pages: list[int] = []
             if num_new_pages > 0:
                 new_pages = self._arena.acquire(num_new_pages)
                 if new_pages is None and self._index is not None:
@@ -1789,7 +2801,7 @@ class KVManager(AttentionResource):
                     )
                 stream.page_indices.extend(new_pages)
                 stream.generation += 1
-        return AllocResult()
+        return AllocResult(new_pages=new_pages)
 
     ### Submodule-level functionality
     # Label / layer cursors come from `AttentionResource`; the readers resolve

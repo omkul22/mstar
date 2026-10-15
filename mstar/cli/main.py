@@ -33,10 +33,16 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "cosmos3_super_i2v_4step": "cosmos3_super_i2v_4step_tp2.yaml",
     "cosmos3_super_t2i_4step": "cosmos3_super_t2i_4step_tp2.yaml",
     "kokoro": "kokoro.yaml",
+    "chatterbox": "chatterbox.yaml",
+    "chatterbox_multilingual": "chatterbox_multilingual.yaml",
+    "chatterbox_turbo": "chatterbox_turbo.yaml",
     "orpheus": "orpheus_colocated.yaml",
     "qwen3_omni": "qwen3omni_2gpu.yaml",
     "qwen3_tts": "qwen3tts.yaml",
     "omnivoice": "omnivoice.yaml",
+    "qwen3_tts_1p7b": "qwen3tts_1p7b.yaml",
+    "qwen3_tts_voicedesign": "qwen3tts_voicedesign.yaml",
+    "qwen3_tts_base": "qwen3tts_base.yaml",
     "pi05": "pi05.yaml",
     "vjepa2": "vjepa2.yaml",
     "vjepa2_ac": "vjepa2_ac.yaml",
@@ -45,7 +51,21 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "higgs_audio": "higgs_audio.yaml",
     "wan22": "wan22.yaml",
     "waypoint": "waypoint.yaml",
+    # Full-duplex speech-to-speech (NemotronLabs VoiceChat-11B).
+    "nemotron_duplex": "nemotron_duplex.yaml",
+    "flux2_klein": "flux2_klein.yaml",
+    "flux2_klein_9b": "flux2_klein_9b.yaml",
+    "z_image_turbo": "z_image_turbo.yaml",
 }
+
+# qwen 3.5 series (dense)
+qwen_3_5_dense_sizes = ("0.8", "2", "4", "9", "27")
+DEFAULT_CONFIGS.update({
+    f"qwen3_5_{size}b": f"qwen3_5_{size}b.yaml" \
+        for size in qwen_3_5_dense_sizes
+})
+# 27B has no single-GPU form
+DEFAULT_CONFIGS["qwen3_5_27b"] = "qwen3_5_27b_tp4.yaml"
 
 
 def _repo_root() -> Path:
@@ -107,6 +127,9 @@ def _next_steps(model: str, host: str, port: int) -> str:
         lines.append("    open(\"out.png\",\"wb\").write(client.generate_image(\"a cat in a hat\"))")
     if model in ("cosmos3", "cosmos3_super"):
         lines.append("    open(\"out.png\",\"wb\").write(client.generate_image(\"a red cube on a wooden table\"))")
+    if model in ("flux2_klein", "flux2_klein_9b", "z_image_turbo"):
+        lines.append("    open(\"out.png\",\"wb\").write(client.generate_image(\"a cat holding a sign\"))")
+        lines.append("    open(\"edit.png\",\"wb\").write(client.edit_image(\"make it a watercolor\", \"out.png\"))")
         lines.append("    res = client.generate(text=\"a robot arm cleaning a plate\", output_modalities=(\"video\",))")
     if model == "cosmos3_droid":
         lines.append("    res = client.generate(text=\"pick up the banana and place it in the bowl\",")
@@ -118,14 +141,26 @@ def _next_steps(model: str, host: str, port: int) -> str:
     if model == "omnivoice":
         lines.append("    client.tts(\"Xin chào\", language=\"Vietnamese\").to_wav(\"out.wav\")")
         lines.append("    # clone a voice: reference_audio=\"ref.wav\", ref_text=\"<its transcript>\"")
-    if model in ("kokoro", "orpheus", "qwen3_omni", "qwen3_tts"):
+    if model in ("kokoro", "orpheus", "qwen3_omni", "qwen3_tts", "qwen3_tts_1p7b"):
         voice = {
             "kokoro": "af_heart",
             "orpheus": "tara",
             "qwen3_omni": "Ethan",
             "qwen3_tts": "Vivian",
+            "qwen3_tts_1p7b": "Vivian",
         }[model]
         lines.append(f"    client.tts(\"Hello there\", voice=\"{voice}\").to_wav(\"out.wav\")")
+    if model in ("chatterbox", "chatterbox_multilingual", "chatterbox_turbo"):
+        lines.append("    client.tts(\"Hello there\", voice=\"default\", cfg_weight=0.5).to_wav(\"out.wav\")")
+        if model == "chatterbox_multilingual":
+            lines.append("    client.tts(\"Bonjour\", voice=\"default\", language_id=\"fr\").to_wav(\"fr.wav\")")
+        lines.append("    # clone a voice: client.generate(text=\"Hello\", audio=\"ref.wav\",")
+        lines.append("    #     input_modalities=(\"text\",\"audio\"), output_modalities=(\"audio\",))")
+    if model == "qwen3_tts_voicedesign":
+        lines.append("    client.tts(\"Hello there\", instruct=\"A calm, warm female voice\").to_wav(\"out.wav\")")
+    if model == "qwen3_tts_base":
+        lines.append("    client.tts(\"Hello there\", reference_audio=\"ref.wav\", "
+                     "ref_text=\"...\").to_wav(\"out.wav\")")
     if model in ("pi05", "vjepa2", "vjepa2_ac"):
         lines.append("    res = client.generate(text=\"...\", output_modalities=(\"" +
                      ("action" if model == "pi05" else "video") + "\",))")
@@ -135,7 +170,8 @@ def _next_steps(model: str, host: str, port: int) -> str:
         lines.append("    print(res.text)  # transcript")
 
     # OpenAI-compatible snippet for the models that map to OpenAI semantics.
-    if model in ("bagel", "qwen3_omni", "orpheus", "kokoro", "cosmos3", "cosmos3_super"):
+    if model in ("bagel", "qwen3_omni", "orpheus", "kokoro", "cosmos3", "cosmos3_super",
+                 "flux2_klein", "flux2_klein_9b", "z_image_turbo"):
         lines += ["", "  OpenAI-compatible:",
                   "    from openai import OpenAI",
                   f"    oai = OpenAI(base_url=\"{base}/v1\", api_key=\"none\")"]
@@ -149,6 +185,8 @@ def _next_steps(model: str, host: str, port: int) -> str:
             lines.append("    oai.images.generate(model=\"bagel\", prompt=\"a cat\")")
         if model in ("cosmos3", "cosmos3_super"):
             lines.append(f"    oai.images.generate(model=\"{model}\", prompt=\"a red cube\", size=\"320x192\")")
+        if model in ("flux2_klein", "flux2_klein_9b", "z_image_turbo"):
+            lines.append(f"    oai.images.generate(model=\"{model}\", prompt=\"a cat in a hat\", size=\"1024x1024\")")
     lines.append("")
     return "\n".join(lines)
 

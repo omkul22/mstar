@@ -32,14 +32,21 @@ from mstar.model.submodule_base import ARNodeInputs
 class _StubTransferManager:
     """No engine, no bytes moved."""
 
-    def __init__(self, transfer_engine_info, kv_cache):
-        del transfer_engine_info, kv_cache
+    def __init__(self, transfer_engine_info, kv_cache, **kwargs):
+        del transfer_engine_info, kv_cache, kwargs
 
-    def get_kv_transfer_info(self):
-        return None
+    def get_kv_transfer_info(self, **kwargs):
+        del kwargs
+
+    def owns_transfer_info(self, transfer_info, **kwargs):
+        del transfer_info, kwargs
+        return False
 
     def cleanup(self):
         pass
+
+    def remove_request(self, request_id):
+        del request_id
 
 
 @pytest.fixture(autouse=True)
@@ -58,7 +65,7 @@ class _RecordingResource:
 def _pool(resource, rids_per_key):
     pool = DummyRowPool(
         prefix="node",
-        step_runner=SimpleNamespace(ingest_request=lambda rid: None),
+        step_runner=SimpleNamespace(ingest_capture_row=lambda rid: None),
         resources={"kv": resource},
     )
     for key, bs in rids_per_key.items():
@@ -121,7 +128,7 @@ def test_capture_spans_come_back_to_the_arena():
         kv.ingest_request(rid)
     pool = DummyRowPool(
         prefix="a",
-        step_runner=SimpleNamespace(ingest_request=lambda rid: None),
+        step_runner=SimpleNamespace(ingest_capture_row=lambda rid: None),
         resources={"kv": kv},
     )
     pool._held["0_slot0"] = list(rids)
@@ -174,7 +181,7 @@ def test_freed_pages_are_reusable_by_a_real_request(page_size):
     _admit(kv, ["__cg_a_0__"], [page_size * 6])
     pool = DummyRowPool(
         prefix="a",
-        step_runner=SimpleNamespace(ingest_request=lambda rid: None),
+        step_runner=SimpleNamespace(ingest_capture_row=lambda rid: None),
         resources={"kv": kv},
     )
     pool._held["0_slot0"] = ["__cg_a_0__"]

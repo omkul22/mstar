@@ -283,8 +283,23 @@ class ForwardPassArgs:
     # is passed into the fwd pass
     step_metadata: dict = field(default_factory=dict)
 
+    # initial args only: CurrentForwardPassInfo.stream_lead_items for the
+    # partition's consumer streams
+    stream_lead_items: dict[str, int] = field(default_factory=dict)
+
 
 class Model(ABC):
+    # Inputs consumed by process_prompt (tokenized or placed on tensor edges).
+    # Retain them locally for postprocessing, but do not send the original
+    # values to the conductor alongside their tensor descriptors.
+    PREPROCESS_ONLY_KWARGS: tuple[str, ...] = ()
+
+    # Intra-op threads for the API server's preprocessing of this model's
+    # inputs (``load_image``, ``process_prompt``, ...). None leaves torch's
+    # default of one per core; ``preprocess_torch_threads`` in the model's
+    # config.yaml overrides either. See ``entrypoint._set_preprocess_threads``.
+    PREPROCESS_TORCH_THREADS: int | None = None
+
     def _get_worker_graphs_for_graph_walk(
         self,
         graph_walk: str,
@@ -604,6 +619,25 @@ class Model(ABC):
 
     def get_max_output_tokens(self, **model_kwargs):
         return model_kwargs.get("max_output_tokens", MAX_OUTPUT_TOKENS)
+
+    def get_max_output_tokens_limit(self) -> int | None:
+        """The largest ``max_output_tokens`` a request may ask for; above it the
+        conductor refuses the request (a 400) rather than stopping short. None
+        is no published limit.
+
+        A model whose decode Loop is built with ``max_iters`` from the
+        kwarg-less ``get_max_output_tokens()`` must return that value: the loop
+        ends there whatever the request asked.
+        """
+        return None
+
+    def request_kwargs(self) -> frozenset[str] | None:
+        """Every ``model_kwargs`` key this model reads, including the ones an
+        OpenAI adapter maps onto it. A request carrying any other key is served,
+        and the key named in the ``X-MStar-Ignored-Params`` response header.
+        None (the default) declares nothing, so nothing is reported.
+        """
+        return None
 
     def get_autocast_dtype(self):
         return torch.bfloat16

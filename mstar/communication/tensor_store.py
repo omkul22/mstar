@@ -69,6 +69,28 @@ class ColumnarTensorInfo:
     def __post_init__(self):
         self._seen_dtypes: dict[torch.dtype, int] = {}
 
+    def dtype_index(self, dtype: torch.dtype) -> int:
+        """The batch-local index of ``dtype``, registering it on first use."""
+        idx = self._seen_dtypes.get(dtype)
+        if idx is None:
+            idx = self._seen_dtypes[dtype] = len(self.dtype_names)
+            self.dtype_names.append(_dtype_name(dtype))
+        return idx
+
+    def add_row(
+        self, uuid: int, address: int, nbytes: int, ndims: int,
+        dims, stride, dtype_idx: int,
+    ) -> None:
+        """One tensor whose layout is already known (a row of a template):
+        its entry in every column, in the layout's order."""
+        self.uuids.append(uuid)
+        self.addresses.append(address)
+        self.nbytes.append(nbytes)
+        self.ndims.append(ndims)
+        self.dims_flat.extend(dims)
+        self.stride_flat.extend(stride)
+        self.dtype_idx.append(dtype_idx)
+
     def add_tensors_canonical(
         self, uuids: list[int],
         canonicals: list[torch.Tensor],
@@ -553,6 +575,10 @@ class TensorStore:
     def __init__(self, bookkeeping: TensorBookkeeping | None = None):
         # {UUID -> tensor}
         self._tensors: dict[int, torch.Tensor] = {}
+        # {UUID -> producer's host copy}, for a ``needs_cpu_tensor`` transport
+        # to send from. Optional and never the only copy; the producer reuses
+        # its memory after the send, so nothing but the send may read it.
+        self._tensors_cpu: dict[int, torch.Tensor] = {}
         # Only for teardown: which uuids a request is responsible for, and the
         # reverse so a single removal does not scan every request. A sliced
         # tensor can outlive its producer's entry (_slice_existing_tensor mints
@@ -571,12 +597,19 @@ class TensorStore:
     def get_tensor(self, uuid: int) -> torch.Tensor:
         return self._tensors[uuid]
 
+    def get_cpu_tensor(self, uuid: int) -> torch.Tensor | None:
+        """The host copy stored alongside ``uuid``, if the producer gave one."""
+        return self._tensors_cpu.get(uuid)
+
     def put_tensor(
         self, request_id: Rid, uuid: int,
         tensor: torch.Tensor,
-        info: TensorPointerInfo
+        info: TensorPointerInfo,
+        cpu_tensor: torch.Tensor | None = None,
     ):
         self._tensors[uuid] = tensor
+        if cpu_tensor is not None:
+            self._tensors_cpu[uuid] = cpu_tensor
         self._rid_to_uuids.setdefault(request_id, set()).add(uuid)
         self._uuid_to_rid[uuid] = request_id
         self.bookkeeping.put_tensor(uuid, info)
@@ -594,6 +627,7 @@ class TensorStore:
     def put_tensor_batch_multi(
         self, request_ids: list[Rid], uuids: list[int],
         tensors: list[torch.Tensor], infos: list[TensorPointerInfo],
+        cpu_tensors: list[torch.Tensor | None] | None = None,
     ):
         """``put_tensor_batch`` spanning requests: one bookkeeping call for a
         whole output batch rather than one per request.
@@ -602,12 +636,13 @@ class TensorStore:
         nothing; it is ``bookkeeping.put_tensor_batch`` that is a Rust boundary
         crossing, and taking every request at once collapses it to one.
         """
-        self._own(request_ids, uuids, tensors)
+        self._own(request_ids, uuids, tensors, cpu_tensors)
         self.bookkeeping.put_tensor_batch(uuids, infos)
 
     def put_tensor_batch_columns(
         self, request_ids: list[Rid], tensors: list[torch.Tensor],
         columns: ColumnarTensorInfo,
+        cpu_tensors: list[torch.Tensor | None] | None = None,
     ):
         """``put_tensor_batch_multi`` for a backend that marshals per tensor.
 
@@ -615,18 +650,29 @@ class TensorStore:
         descriptor per tensor. ``columns.uuids`` is the same order as
         ``tensors``, which is what keeps the ownership maps aligned.
         """
-        self._own(request_ids, columns.uuids, tensors)
+        self._own(request_ids, columns.uuids, tensors, cpu_tensors)
         self.bookkeeping.put_tensor_batch_columns(columns)
 
     def _own(
         self, request_ids: list[Rid], uuids: list[int], tensors: list[torch.Tensor],
+        cpu_tensors: list[torch.Tensor | None] | None = None,
     ):
         """Record which request owns each tensor. Pure Python dicts, so this
-        stays a loop -- only the bookkeeping call crosses into Rust."""
-        for request_id, uuid, tensor in zip(request_ids, uuids, tensors, strict=True):
-            self._tensors[uuid] = tensor
-            self._rid_to_uuids.setdefault(request_id, set()).add(uuid)
-            self._uuid_to_rid[uuid] = request_id
+        stays a loop -- only the bookkeeping call crosses into Rust.
+        ``cpu_tensors``, when given, is index-parallel to ``tensors``."""
+        if len(request_ids) != len(uuids) or len(uuids) != len(tensors):
+            raise ValueError("request_ids, uuids and tensors must be parallel")
+        # two of the three maps take the batch in one update each; only the
+        # per-request set stays a loop
+        self._tensors.update(zip(uuids, tensors, strict=True))
+        self._uuid_to_rid.update(zip(uuids, request_ids, strict=True))
+        owned = self._rid_to_uuids
+        for request_id, uuid in zip(request_ids, uuids, strict=True):
+            owned.setdefault(request_id, set()).add(uuid)
+        if cpu_tensors is not None:
+            for uuid, cpu_tensor in zip(uuids, cpu_tensors, strict=True):
+                if cpu_tensor is not None:
+                    self._tensors_cpu[uuid] = cpu_tensor
 
     def check_uuid_presence(self, uuid: int) -> bool:
         return uuid in self._tensors
@@ -634,6 +680,7 @@ class TensorStore:
     def remove_tensor(self, uuid: int):
         forgotten = uuid in self._forgotten
         self._forgotten.discard(uuid)
+        self._tensors_cpu.pop(uuid, None)
         if self._tensors.pop(uuid, None) is None:
             return
         if not forgotten:

@@ -35,11 +35,18 @@ SEED = 20260920
 class _StubTransfer:
     """No engine, no bytes moved: retrieves complete immediately."""
 
-    def __init__(self, transfer_engine_info, kv_cache):
-        del transfer_engine_info, kv_cache
+    def __init__(self, transfer_engine_info, kv_cache, **kwargs):
+        del transfer_engine_info, kv_cache, kwargs
 
-    def get_kv_transfer_info(self):
-        return None
+    def get_kv_transfer_info(self, **kwargs):
+        del kwargs
+
+    def owns_transfer_info(self, transfer_info, **kwargs):
+        del kwargs
+        return transfer_info == self.get_kv_transfer_info()
+
+    def remove_request(self, request_id):
+        del request_id
 
     def start_async_retrieve(self, **kwargs):
         del kwargs
@@ -302,3 +309,23 @@ def test_the_flag_puts_the_check_on_the_lifecycle(monkeypatch):
 
     with pytest.raises(AssertionError, match="owner counts disagree"):
         _grow(kv, "r0", PAGE_SIZE)
+
+
+@pytest.mark.parametrize("page_size", [1, 16])
+def test_kv_lens_match_flashinfer_seq_lens(page_size):
+    """The host lengths handed to FlashInfer's decode plan are exactly what it
+    would have rebuilt from the indptrs itself."""
+    from flashinfer.page import get_seq_lens
+
+    from mstar.engine.resources.kv.plan import SequenceView, build_paged_indptrs
+
+    views = [
+        SequenceView("a", "main", page_idxs=[3], length=1, to_compute=1),
+        SequenceView("b", "main", page_idxs=[4, 5], length=page_size + 1, to_compute=1),
+        SequenceView("c", "main", page_idxs=[6, 7], length=2 * page_size, to_compute=1),
+        SequenceView("d", "main", page_idxs=[], length=0, to_compute=0),
+    ]
+    ind = build_paged_indptrs(views, page_size)
+    expected = get_seq_lens(ind.paged_kv_indptr, ind.paged_kv_last_page_len, page_size)
+    assert ind.kv_lens.dtype == expected.dtype
+    assert torch.equal(ind.kv_lens, expected)

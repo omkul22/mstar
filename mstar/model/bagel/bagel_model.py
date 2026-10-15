@@ -86,6 +86,7 @@ from mstar.model.loader.base import LLAMA_STACKED_PARAMS, StackedParamRule
 from mstar.model.multimodal import (
     TEXT,
     PromptPart,
+    chat_turns,
     check_attachments,
     check_plan,
     find_media_spans,
@@ -94,6 +95,7 @@ from mstar.model.multimodal import (
     split_around_spans,
 )
 from mstar.model.submodule_base import NodeSubmodule
+from mstar.model.utils import drop_stop_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -301,6 +303,12 @@ class BagelModel(Model):
 
         # Set by get_worker_graphs() when config has LLM_cfg_text/LLM_cfg_img
         self._has_cfg_parallel = False
+        # Set when graph-walk-specific node groups place LLM cache consumers
+        # in separate worker instances.
+        self._has_llm_disaggregation = False
+        # The separate image-generation placement needs serial denoising
+        # until its published KV handoff and speculative scheduling agree.
+        self._image_gen_remote_handoff = False
 
     @property
     def _image_gen_walk(self) -> str:
@@ -440,13 +448,7 @@ class BagelModel(Model):
                 node_name=node_name,
             )
         elif node_name == "combine_cfg":
-            self._init_language_model_components(
-                device, autocast_dtype=autocast_dtype, tp_group=tp_group,
-            )
-            return CombineCFGSubmodule(
-                llm2vae=self.llm2vae,
-                config=self.config,
-            )
+            return CombineCFGSubmodule(config=self.config)
         elif node_name == "vit_encoder":
             self._init_vit_components(device, autocast_dtype=autocast_dtype)
             return ViTEncoderSubmodule(
@@ -492,10 +494,6 @@ class BagelModel(Model):
     )
     VLM_UNDERSTANDING_SUFFIX = "\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
 
-    # For text-to-text, BAGEL doesn't seem to do as well with the "user... assistant..." format
-    VLM_UNDERSTANDING_TEMPLATE = "<|im_start|>{system_prompt}<|im_end|>" + \
-        "<|im_start|>{prompt}<|im_end|><|im_start|>"
-
     # Image generation (T2I/I2I): bare wrapping, no system prompt or roles. Input
     # image (I2I) is positioned before this by the prefill_vae/vit walks.
     GEN_TEMPLATE = "<|im_start|>{prompt}<|im_end|><|im_start|>"
@@ -505,9 +503,10 @@ class BagelModel(Model):
     # embeddings, so only the pad interior is dropped from the text spans.
     IMAGE_PLACEHOLDER = "<|vision_start|><|image_pad|><|vision_end|>"
 
-    # VLM_UNDERSTANDING_SUFFIX minus the text it used to interpolate, which is
-    # now written at its own place in the prompt.
-    UNDERSTANDING_TAIL = "<|im_end|>\n<|im_start|>assistant\n"
+    # One understanding turn, its attachments inside it: the system prompt's
+    # comes first, and the reply opens after the last.
+    VLM_TURN = "<|im_start|>{role}\n{content}<|im_end|>\n"
+    VLM_REPLY = "<|im_start|>assistant\n"
 
     def _placeholder_specs(self) -> dict[str, tuple[int, int, int]]:
         """``(start, pad, end)`` sentinel ids, read off the tokenizer.
@@ -528,38 +527,56 @@ class BagelModel(Model):
     ) -> str:
         """Write the request out in order, attachments as placeholders.
 
-        Understanding opens the user turn before the attachments and closes it
-        after the last; a text run following an attachment carries the newline
-        the old suffix supplied, so every layout that template could express
-        renders to the same string. Generation leaves attachments outside the
-        turn — the prefill_vae/vit walks put the input image ahead of the
-        prompt — and wraps what follows.
+        Understanding writes each turn in its own role block. A text run
+        following an attachment carries the newline the old suffix supplied,
+        and a turn ending on one closes after a newline too, so every image
+        layout a single user turn could express renders to the string that
+        template gave. Generation leaves attachments outside the turn — the
+        prefill_vae/vit walks put the input image ahead of the prompt — and
+        wraps what follows.
         """
-        # Understanding's old suffix supplied this newline; generation's did not.
-        sep = "\n" if is_understanding else ""
-        body: list[str] = []
-        after_attachment = False
-        for part in parts:
-            if part.modality == TEXT:
-                if part.text:
-                    body.append((sep if after_attachment else "") + part.text)
-                    after_attachment = False
-                continue
-            body.append(self.IMAGE_PLACEHOLDER)
-            after_attachment = True
-
         if is_understanding:
-            head = self.VLM_UNDERSTANDING_PREFIX.format(system_prompt=system_prompt)
-            tail = "\n" + self.UNDERSTANDING_TAIL if after_attachment else self.UNDERSTANDING_TAIL
-            return head + "".join(body) + tail
+            blocks = [self.VLM_TURN.format(role="system", content=system_prompt)]
+            for turn in chat_turns(parts):
+                body, after_attachment = self._render_body(turn.parts, sep="\n")
+                if after_attachment:
+                    body.append("\n")
+                blocks.append(self.VLM_TURN.format(role=turn.role, content="".join(body)))
+            return "".join(blocks) + self.VLM_REPLY
 
         # Generation: attachments written before any text stay outside the turn.
+        body, _ = self._render_body(parts, sep="")
         lead = 0
         while lead < len(body) and body[lead] == self.IMAGE_PLACEHOLDER:
             lead += 1
         return "".join(body[:lead]) + self.GEN_TEMPLATE.format(
             prompt="".join(body[lead:])
         )
+
+    def _render_body(self, parts: list[PromptPart], sep: str) -> tuple[list[str], bool]:
+        """Write ``parts`` out in order, and say whether the last is an attachment.
+
+        ``sep`` opens a text run that follows an attachment: understanding's old
+        suffix supplied that newline, generation's did not. Text that follows
+        another role's text starts on a new line.
+        """
+        body: list[str] = []
+        after_attachment = False
+        role = None
+        for part in parts:
+            if part.modality == TEXT:
+                if part.text:
+                    if after_attachment:
+                        body.append(sep + part.text)
+                    elif body and part.role != role:
+                        body.append("\n" + part.text)
+                    else:
+                        body.append(part.text)
+                    after_attachment, role = False, part.role
+                continue
+            body.append(self.IMAGE_PLACEHOLDER)
+            after_attachment = True
+        return body, after_attachment
 
     def _encode_text(self, text: str) -> torch.Tensor:
         """Tokenize a text segment, falling back to raw bytes when no tokenizer
@@ -600,11 +617,12 @@ class BagelModel(Model):
             think_mode = kwargs.get("think_mode", self.config.think_mode)
             system_prompt = self.BAGEL_DEFAULT_SYSTEM_PROMPT
 
-            parts = parts_from_modalities(
-                input_modalities,
-                [p.text or "" for p in prompt_parts if p.modality == TEXT]
-                if prompt_parts is not None else prompt,
-            )
+            texts, roles = prompt, None
+            if prompt_parts is not None:
+                texts = [p.text or "" for p in prompt_parts if p.modality == TEXT]
+                roles = [p.role for p in prompt_parts]
+            # a legacy layout can lack a text slot, and its prompt still needs one
+            parts = parts_from_modalities(input_modalities or [TEXT], texts, roles)
             unsupported = {p.modality for p in parts} - {TEXT, "image"}
             if unsupported:
                 raise ValueError(
@@ -616,22 +634,23 @@ class BagelModel(Model):
                     parts, {"image": len(tensors.get("image_inputs", []))},
                 )
 
+            body = parts
+            if is_understanding and len(parts) > 1 and parts[0].role == "system":
+                # a leading system message takes the default's place; a lone
+                # one stays the turn it was, not an empty one after the default
+                system_prompt, body = parts[0].text, parts[1:]
             if think_mode and is_understanding:
                 system_prompt = f"{system_prompt} {VLM_THINK_SYSTEM_PROMPT}"
 
+            text = self._render_prompt(
+                body,
+                is_understanding=is_understanding,
+                system_prompt=system_prompt,
+            )
             if is_understanding and not has_image:
                 # No attachment: one span, one walk, nothing to scan.
-                segments = [self._encode_text(
-                    self.VLM_UNDERSTANDING_TEMPLATE.format(
-                        system_prompt=system_prompt, prompt=prompt
-                    )
-                )]
+                segments = [self._encode_text(text)]
             else:
-                text = self._render_prompt(
-                    parts,
-                    is_understanding=is_understanding,
-                    system_prompt=system_prompt,
-                )
                 input_ids = self._encode_text(text)
                 spans = find_media_spans(input_ids, self._placeholder_specs())
                 segments = split_around_spans(input_ids, spans)
@@ -710,7 +729,8 @@ class BagelModel(Model):
         request_kwargs: dict | None = None,
     ) -> bytes:
         if modality == "text":
-            detok = self.tokenizer.decode(output)
+            ids = drop_stop_tokens(output, (self.eos_token_id,), request_kwargs)
+            detok = self.tokenizer.decode(ids)
             logger.debug("OUTPUT TEXT %s", detok)
             return detok.encode("utf-8")
         if modality == "image":
@@ -740,6 +760,7 @@ class BagelModel(Model):
 
         The image walks write into this stream too, and an edit's picture lands
         at the positions its keyed text would have; only the text walk is named.
+        A chat sends a reply back as its own assistant turn, so its pages match.
         """
         return {"kv": {"main": PrefixStream(
             "text_inputs", "ids", "prefill_text", "decode",
@@ -811,16 +832,47 @@ class BagelModel(Model):
         model_kwargs = model_kwargs or {}
         cfg = partition_fwd_args[DEFAULT_PARTITION].full_metadata.kwargs["requires_cfg"]
         sampling = self.get_sampling_config("LLM", model_kwargs)
+        publish_labels: dict[tuple[str, str], list[str]] = {}
+        final_publish_labels: dict[tuple[str, str], list[str]] = {}
+        if cfg:
+            publish_labels.update({
+                ("LLM", "prefill_text"): ["cfg_text", "cfg_img"],
+                ("LLM", "prefill_vit"): ["cfg_text"],
+                ("LLM", "prefill_vae"): ["cfg_text"],
+            })
+            final_publish_labels[("LLM", "decode")] = ["cfg_img"]
+
+        if self._has_llm_disaggregation:
+            # Any prefill walk can be the last one before a remote decode or
+            # image-generation worker. Decode itself may hand off to a remote
+            # image-generation worker, but only its final state is needed.
+            for walk in ("prefill_text", "prefill_vit", "prefill_vae"):
+                publish_labels.setdefault(("LLM", walk), []).insert(0, "main")
+            final_publish_labels.setdefault(
+                ("LLM", "decode"), []
+            ).insert(0, "main")
+
         return {
             # The KV resource reads this in admit_retrieve, to know which of a
             # published request's streams to pull in. Guidance-off requests
             # name only "main", so a transfer never drags branches that this
             # request will not attend.
-            "kv": KVReqConfig(needed_labels_per_node_walk={
-                (node, walk): active_labels(walk, cfg, node)
-                for node in self._LLM_NODES
-                for walk in LLM_GRAPH_WALKS
-            }),
+            "kv": KVReqConfig(
+                needed_labels_per_node_walk={
+                    (node, walk): active_labels(walk, cfg, node)
+                    for node in self._LLM_NODES
+                    for walk in LLM_GRAPH_WALKS
+                },
+                # Only the main LLM instance creates cache branches consumed
+                # by the remote CFG replicas. Text-only requests export
+                # nothing. Think-then-image exports cfg_img once after decode
+                # stops, so image_gen_cfg sees the final KV without rewriting
+                # the SHM payload on every token. Disaggregated LLM placements
+                # additionally export main at prefill boundaries and once when
+                # decode stops.
+                publish_labels_per_node_walk=publish_labels,
+                final_publish_labels_per_node_walk=final_publish_labels,
+            ),
             "sampler": SamplingReqConfig(
                 temperature=sampling.temperature,
                 top_k=sampling.top_k,
@@ -847,7 +899,9 @@ class BagelModel(Model):
         from mstar.distributed.base import ShardingConfig
 
         return ShardingConfig(
-            groups=[], tp_enabled_nodes={"LLM"}, shard_dim={},
+            groups=[],
+            tp_enabled_nodes={"LLM", "LLM_cfg_text", "LLM_cfg_img"},
+            shard_dim={},
         )
 
     def get_worker_graphs(self, config_path: str):
@@ -859,6 +913,24 @@ class BagelModel(Model):
             name for g in node_groups for name in g["node_names"]
         }
         self._has_cfg_parallel = "LLM_cfg_text" in all_node_names
+        self._has_llm_disaggregation = sum(
+            "LLM" in group["node_names"] for group in node_groups
+        ) > 1
+        def llm_ranks(walk: str) -> set[int]:
+            return {
+                rank
+                for group in node_groups
+                if "LLM" in group["node_names"]
+                and (not group.get("graph_walks") or walk in group["graph_walks"])
+                for rank in group["ranks"]
+            }
+
+        image_ranks = llm_ranks("image_gen")
+        self._image_gen_remote_handoff = bool(
+            image_ranks
+            and image_ranks.isdisjoint(llm_ranks("prefill_text"))
+            and image_ranks.isdisjoint(llm_ranks("decode"))
+        )
         return super().get_worker_graphs(config_path)
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
@@ -951,6 +1023,11 @@ class BagelModel(Model):
                         GraphEdge(next_node="LLM", name="latents"),
                         GraphEdge(next_node="LLM", name="time_index"),
                     ],
+                    # A separate image-generation worker combines a remote
+                    # KV handoff with this loop. The Rust speculative path
+                    # produced nondeterministic seeded output on that layout;
+                    # serial steps preserve the handoff's output.
+                    enable_async_scheduling=not self._image_gen_remote_handoff,
                 ),
                 max_iters=self.config.num_timesteps - 1,
                 outputs=[

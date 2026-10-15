@@ -33,6 +33,8 @@ from mstar.model.base import ForwardPassArgs, Model, WorkerGraph
 from mstar.profile.format import RxInfo, TxInfo
 from mstar.profile.worker import GraphTimings
 from mstar.utils.exitcode import describe_exitcode
+from mstar.utils.gc_freeze import freeze_after_setup
+from mstar.utils.generation_kwargs import check_seed
 from mstar.utils.ipc_format import (
     ConductorMessageType,
     DrainRequest,
@@ -49,7 +51,7 @@ from mstar.utils.ipc_format import (
 )
 from mstar.utils.logging_config import quiet_noisy_loggers
 from mstar.utils.orphan import exit_when_orphaned
-from mstar.utils.profiler import range_pop, range_push
+from mstar.utils.profiler import nvtx_enabled, range_pop, range_push
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +82,18 @@ def _req_id_to_seed(req_id: str):
     """
     digest = hashlib.md5(req_id.encode("utf-8")).digest()
     return int.from_bytes(digest[:4], "little")
+
+
+def _request_seed(model_kwargs: dict, request_id: str) -> int:
+    """The request's seed: its explicit ``seed`` kwarg, else one from its id.
+
+    Raises ``ValueError`` on a bad explicit seed (see ``check_seed``).
+    """
+    seed = model_kwargs.get("seed")
+    if seed is None:
+        return _req_id_to_seed(request_id)
+    check_seed(seed)
+    return seed
 
 
 def _pick_free_tcp_port() -> int:
@@ -209,6 +223,8 @@ class RequestData:
     # resource label -> the config this request's resources were opened with
     resource_configs: dict[str, ResourceReqConfig]
     sharding_config: ShardingConfig | None = None
+    # set once a NewRequest goes out; before that a failed ingest has nothing to drain
+    dispatched: bool = False
 
     # Partition state (always populated — single-partition models use a "default" partition)
     partition_states: dict[str, PartitionState] = field(default_factory=dict)
@@ -304,7 +320,6 @@ class Conductor:
         self.hostname = hostname
         self.socket_path_prefix = socket_path_prefix
         self.log_level = log_level
-        self.enable_nvtx = enable_nvtx
         self.enable_prof = enable_prof
         self.tensor_comm_protocol = tensor_comm_protocol
         self.tcp_transfer_device = tcp_transfer_device
@@ -321,6 +336,7 @@ class Conductor:
             self.model_config = yaml.safe_load(f)
         accelerator = torch.accelerator.current_accelerator(check_available=True)
         self.device_type = accelerator.type if accelerator is not None else "cpu"
+        self.enable_nvtx = nvtx_enabled(enable_nvtx, torch.device(self.device_type))
         logger.info("Detected worker device type: %s", self.device_type)
         self.max_concurrent_requests: int = self.model_config.get(
             "max_concurrent_requests", None
@@ -428,6 +444,34 @@ class Conductor:
             push_ids=self.worker_ids + ["api_server", "api_server_preprocess_worker"],
             ipc_socket_path_prefix=socket_path_prefix,
         )
+
+    def _max_output_tokens(self, model_kwargs: dict) -> int:
+        """The request's output cap: an int >= 1 within the model's published
+        limit, else ``ValueError`` (a 400). Checked here because the cap is
+        compared inside the run loop, where a non-int would raise and the
+        request would hang."""
+        requested = model_kwargs.get("max_output_tokens")
+        if requested is not None and (
+            isinstance(requested, bool) or not isinstance(requested, int) or requested < 1
+        ):
+            raise ValueError(f"max_output_tokens must be an integer >= 1; got {requested!r}")
+        limit = self.model.get_max_output_tokens_limit()
+        if requested is not None and limit is not None and requested > limit:
+            raise ValueError(
+                f"max_output_tokens is {requested}; this model produces at most {limit}"
+            )
+        cap = self.model.get_max_output_tokens(**model_kwargs)
+        if isinstance(cap, bool) or not isinstance(cap, int) or cap < 1:
+            raise ValueError(f"max_output_tokens must be an integer >= 1; got {cap!r}")
+        return cap
+
+    def _resource_specs(self) -> dict:
+        """The model's resource specs by key, for admission-time capability checks."""
+        specs = getattr(self, "_resource_specs_cache", None)
+        if specs is None:
+            specs = {s.resource_key: s for s in (self.model.get_node_resources() or [])}
+            self._resource_specs_cache = specs
+        return specs
 
     def _get_resource_configs(
         self, model_kwargs: dict,
@@ -731,6 +775,35 @@ class Conductor:
                 )
                 for dest_worker, sliced_edge in fanout.items():
                     inputs_per_worker[dest_worker].append(sliced_edge)
+        # The split above yields one edge per (rank, node, walk), so a name
+        # produced across walks arrives as several. The consumer would take the
+        # second as the next iteration's input and drop the third, so rejoin
+        # them in persist order. Keyed by source rank: a TP fan-in edge stays
+        # one per rank, which is what the consumer consolidates on.
+        for dest_worker, edges in inputs_per_worker.items():
+            merged: list[GraphEdge] = []
+            first_by_key: dict[tuple[str, str, int], GraphEdge] = {}
+            for edge in edges:
+                if not edge.tensor_info:
+                    merged.append(edge)  # signal-only, nothing to join
+                    continue
+                key = (
+                    edge.name, edge.next_node,
+                    edge.tensor_info[0].source_tp_rank,
+                )
+                first = first_by_key.get(key)
+                if first is not None:
+                    # Rank numbering only lines up if the contributors share a
+                    # source TP size, which is what fan-in counts.
+                    assert first._total_fanin == edge._total_fanin, (
+                        f"{edge.name}: contributors to one name disagree on "
+                        f"fan-in ({first._total_fanin} vs {edge._total_fanin})"
+                    )
+                    first.tensor_info = first.tensor_info + edge.tensor_info
+                    continue
+                first_by_key[key] = edge
+                merged.append(edge)
+            inputs_per_worker[dest_worker] = merged
         return inputs_per_worker
 
     def _update_persist_ref_counts(
@@ -786,7 +859,7 @@ class Conductor:
                 body.request_id, len(self.requests),
                 str(self.max_concurrent_requests),
             )
-            self._do_ingest_request(body)
+            self._admit_request(body)
 
     def _ingest_request(
         self, body: NewRequestConductor
@@ -807,6 +880,11 @@ class Conductor:
                 "Request %s was aborted before ingest; dropping", body.request_id
             )
             return
+        try:
+            _request_seed(body.model_kwargs or {}, body.request_id)
+        except ValueError as exc:
+            self._reject_request(body.request_id, str(exc), status=400)
+            return
         if (self.max_concurrent_requests is not None
                 and len(self.requests) >= self.max_concurrent_requests):
             logger.info(
@@ -818,9 +896,55 @@ class Conductor:
             return
         if self.enable_nvtx:
             range_push("conductor._do_ingest_request")
-        self._do_ingest_request(body)
+        self._admit_request(body)
         if self.enable_nvtx:
             range_pop()
+
+    def _admit_request(self, body: NewRequestConductor):
+        """Dispatch ``body``; if that raises, fail the request instead of dropping it.
+
+        An exception here would otherwise reach the run loop, which only logs
+        it, and the client would wait for its timeout. A ``ValueError`` raised
+        before any worker heard of the request is the client's fault: a 400.
+        """
+        try:
+            self._do_ingest_request(body)
+        # Any failure must reach the client.
+        except Exception as exc:  # noqa: BLE001
+            request_data = self.requests.get(body.request_id)
+            if request_data is None or not request_data.dispatched:
+                self.requests.pop(body.request_id, None)
+                if isinstance(exc, ValueError):
+                    self._reject_request(body.request_id, str(exc), status=400)
+                    return
+                logger.exception("Ingest failed for request %s", body.request_id)
+                self._reject_request(
+                    body.request_id, f"Ingest failed: {type(exc).__name__}: {exc}", status=500,
+                )
+            elif body.request_id not in self.draining:
+                logger.exception("Ingest failed for request %s", body.request_id)
+                # Some workers may already hold it: drain them like a worker failure.
+                self._remove_request(
+                    body.request_id, request_data,
+                    failure_error=f"Ingest failed: {type(exc).__name__}: {exc}",
+                )
+
+    def _reject_request(self, request_id: str, error: str, status: int):
+        """Fail a request that was never dispatched to any worker.
+
+        Only the preprocess worker holds its input signals, so hard-remove
+        them there, as an abort before admission does, then tell the client.
+        """
+        logger.info("Rejecting request %s (%d): %s", request_id, status, error)
+        self._early_reads_done.pop(request_id, None)
+        self._send_remove_to_preprocess_worker(request_id)
+        self.communicator.send(
+            "api_server",
+            APIServerMessage(
+                message_type="request_failed",
+                body=RequestFailed(request_id=request_id, error_message=error, status=status),
+            ),
+        )
 
     def _do_ingest_request(
         self, body: NewRequestConductor
@@ -831,11 +955,11 @@ class Conductor:
         worker_graph_to_workers = self._assign_worker_graphs_to_workers()
 
         model_kwargs = body.model_kwargs or {}
-        max_output_tokens = self.model.get_max_output_tokens(**model_kwargs)
+        max_output_tokens = self._max_output_tokens(model_kwargs)
         # Honor an explicit per-request seed (e.g. OpenAI ``seed``) when given;
-        # otherwise derive a stable seed from the request id.
-        explicit_seed = model_kwargs.get("seed")
-        seed = int(explicit_seed) if explicit_seed is not None else _req_id_to_seed(body.request_id)
+        # otherwise derive a stable seed from the request id. ``_ingest_request``
+        # already rejected a bad one.
+        seed = _request_seed(model_kwargs, body.request_id)
 
         partitions = self.model.get_partitions()
         topology = self.model.get_partition_topology()
@@ -914,6 +1038,9 @@ class Conductor:
         request_data.resource_configs = self._get_resource_configs(
             model_kwargs, partition_fwd_args
         )
+        specs = self._resource_specs()
+        for key, cfg in request_data.resource_configs.items():
+            cfg.validate(specs.get(key))
         # keyed by resource, so each config is handed only its own chain
         kwargs = model_kwargs or {}
         prefix_keys = kwargs.get("prefix_keys") or {}
@@ -923,6 +1050,7 @@ class Conductor:
         for key, cfg in request_data.resource_configs.items():
             cfg.apply_conductor_config(
                 seed=seed,
+                resource_key=key,
                 prefix_keys=prefix_keys.get(key),
                 prefix_tail=prefix_tail.get(key),
                 prefix_decode=prefix_decode.get(key),
@@ -930,6 +1058,7 @@ class Conductor:
             )
 
         # Send NewRequest to each worker with the appropriate partition's inputs
+        request_data.dispatched = True
         for worker_id, worker_graph_ids in worker_to_worker_graph_ids.items():
             # Determine which partition this worker serves
             for partition_name, partition_wg_ids in self._resolve_worker_partition(
@@ -957,6 +1086,7 @@ class Conductor:
                         request_id=body.request_id,
                         graph_walk=fwd_args.full_metadata.graph_walk,
                         step_metadata=fwd_args.step_metadata,
+                        stream_lead_items=fwd_args.stream_lead_items,
                         fwd_index=pstate.fwd_pass_number,
                         random_seed=pstate.random_seed,
                         partition_name=partition_name,
@@ -1278,13 +1408,16 @@ class Conductor:
             for name, infos in body.persist_signals.items():
                 request_data.persist_signals.setdefault(name, []).extend(infos)
 
+        # Resource publish info is rank-sharded. Every TP rank contributes its
+        # own KV pages and transfer descriptor, and PublishedKVInfo.update()
+        # folds those entries by rank.
+        merge_publish_info(
+            pstate.resource_publish_info, body.resource_publish_info
+        )
+
         # Absorb-only fields are replicated across TP ranks; only the rank-0
         # message contributes.
         if body.is_first_tp_rank:
-            merge_publish_info(
-                pstate.resource_publish_info, body.resource_publish_info
-            )
-
             if body.new_token_counts:
                 for name, count in body.new_token_counts.items():
                     pstate.num_output_tokens += count
@@ -1349,6 +1482,19 @@ class Conductor:
         )
         pstate.metadata = fwd_args.full_metadata
         pstate.metadata.kwargs.update(fwd_args.step_metadata)
+
+        # The worker's signal is authoritative for a stream-terminated
+        # partition: the pass that consumed the stream's final chunk has run.
+        # Treat it as the partition's own `request_done` so its downstream
+        # connections get `producer_done` and the chain closes. A model that
+        # inferred the end from the connection counters instead
+        # (`consumed_count >= token_count`) could race: `consumed_count` counts
+        # chunks popped for execution, and every worker-graphs-done report from
+        # a worker carries every buffer's count, so a colocated consumer's report
+        # could finish this partition while its last step was still running,
+        # and that step's output arrived for a request already gone.
+        if incoming_connections and partition_done_from_worker:
+            fwd_args.request_done = True
 
         # Check max output tokens for partitions that produce tokens
         if pstate.num_output_tokens >= request_data.max_output_tokens:
@@ -1491,6 +1637,8 @@ class Conductor:
         from mstar.utils.profiler import range_pop, range_push
 
         self._wait_for_workers_ready()
+        # the set-up heap is complete: keep gen-2 collections off it
+        freeze_after_setup("Conductor")
 
         self.communicator.send(
             "api_server",

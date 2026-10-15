@@ -4,6 +4,9 @@ from mstar.model.base import Model
 
 MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "bagel": ("mstar.model.bagel.bagel_model", "BagelModel"),
+    "chatterbox": ("mstar.model.chatterbox.chatterbox_model", "ChatterboxModel"),
+    "chatterbox_multilingual": ("mstar.model.chatterbox.chatterbox_model", "ChatterboxModel"),
+    "chatterbox_turbo": ("mstar.model.chatterbox.chatterbox_model", "ChatterboxModel"),
     "cosmos3": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
     "cosmos3_droid": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
     "cosmos3_edge": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
@@ -11,7 +14,10 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "cosmos3_super": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
     "cosmos3_super_i2v_4step": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
     "cosmos3_super_t2i_4step": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
+    "flux2_klein": ("mstar.model.flux2_klein.flux2_klein_model", "Flux2KleinModel"),
+    "flux2_klein_9b": ("mstar.model.flux2_klein.flux2_klein_model", "Flux2KleinModel"),
     "higgs_audio": ("mstar.model.higgs_audio.higgs_audio_model", "HiggsAudioModel"),
+    "nemotron_duplex": ("mstar.model.nemotron_duplex.nemotron_duplex_model", "NemotronDuplexModel"),
     "omnivoice": ("mstar.model.omnivoice.omnivoice_model", "OmniVoiceModel"),
     "kokoro": ("mstar.model.kokoro.kokoro_model", "KokoroModel"),
     "orpheus": ("mstar.model.orpheus.orpheus_model", "OrpheusModel"),
@@ -19,15 +25,28 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "pi05": ("mstar.model.pi05.pi05_model", "Pi05Model"),
     "qwen3_omni": ("mstar.model.qwen3_omni.qwen3_omni_model", "Qwen3OmniModel"),
     "qwen3_tts": ("mstar.model.qwen3_tts.qwen3_tts_model", "Qwen3TTSModel"),
+    "qwen3_tts_1p7b": ("mstar.model.qwen3_tts.qwen3_tts_model", "Qwen3TTSModel"),
+    "qwen3_tts_voicedesign": ("mstar.model.qwen3_tts.qwen3_tts_model", "Qwen3TTSModel"),
+    "qwen3_tts_base": ("mstar.model.qwen3_tts.qwen3_tts_model", "Qwen3TTSModel"),
     "vjepa2": ("mstar.model.vjepa2.vjepa2_model", "VJepa2Model"),
     "vjepa2_ac": ("mstar.model.vjepa2.vjepa2_model", "VJepa2ACModel"),
     "wan22": ("mstar.model.wan22.wan22_model", "Wan22Model"),
     "waypoint": ("mstar.model.waypoint.waypoint_model", "WaypointModel"),
     "whisper_large": ("mstar.model.whisper.whisper_model", "WhisperModel"),
+    "z_image_turbo": ("mstar.model.z_image.z_image_model", "ZImageModel"),
 }
 
 HF_MODELS: dict[str, dict] = {
     "bagel": {"model_path_hf": "ByteDance-Seed/BAGEL-7B-MoT"},
+    # Resemble AI Chatterbox: Llama-520M T3 speech-token LM + S3Gen flow
+    # matching decoder + HiFT vocoder, zero-shot voice cloning with CFG and
+    # exaggeration control. The Turbo checkpoint is a GPT-2-medium T3 with a
+    # distilled two-step decoder; same class, variant picked from the repo id.
+    # The 23-language checkpoint lives in the same repo as the English one
+    # (a T3 with a 2454-token grapheme vocabulary), so its variant is named.
+    "chatterbox": {"model_path_hf": "ResembleAI/chatterbox"},
+    "chatterbox_multilingual": {"model_path_hf": "ResembleAI/chatterbox", "variant": "multilingual"},
+    "chatterbox_turbo": {"model_path_hf": "ResembleAI/chatterbox-turbo"},
     # NVIDIA Cosmos3-Nano generator (diffusers transformer/ + Wan VAE + UniPC).
     "cosmos3": {"model_path_hf": "nvidia/Cosmos3-Nano"},
     # Cosmos3-Nano-Policy-DROID — Nano-sized action-policy fine-tune for the
@@ -52,9 +71,18 @@ HF_MODELS: dict[str, dict] = {
     # deployment as Super.
     "cosmos3_super_i2v_4step": {"model_path_hf": "nvidia/Cosmos3-Super-Image2Video-4Step"},
     "cosmos3_super_t2i_4step": {"model_path_hf": "nvidia/Cosmos3-Super-Text2Image-4Step"},
+    # FLUX.2 [klein]: step-distilled rectified-flow text-to-image + multi-reference
+    # editing (Qwen3 hidden-state text encoder, FLUX.2 VAE). 4B is Apache-2.0; 9B is
+    # under the FLUX Non-Commercial License. Same class, all dims from the checkpoint.
+    "flux2_klein": {"model_path_hf": "black-forest-labs/FLUX.2-klein-4B"},
+    "flux2_klein_9b": {"model_path_hf": "black-forest-labs/FLUX.2-klein-9B"},
     # Higgs-Audio v3 STT: Whisper-style audio tower + Qwen3-1.7B LLM.
     # (The v2 checkpoints are TTS/generation models, not ASR.)
     "higgs_audio": {"model_path_hf": "bosonai/higgs-audio-v3-stt"},
+    # NVIDIA NemotronLabs VoiceChat-11B: full-duplex S2S -- Fast-Conformer STT
+    # encoder + Nemotron-H hybrid Mamba-2/attn/MLP backbone (9B) + EarTTS
+    # (Gemma3 talker + RVQ codec). Single composite ``model.safetensors``.
+    "nemotron_duplex": {"model_path_hf": "nvidia/NVIDIA-NemotronLabs-VoiceChat-11B"},
     # OmniVoice — masked-diffusion TTS, 600+ languages. A Qwen3-0.6B body read
     # bidirectionally over an 8-codebook canvas, plus the Higgs-Audio-v2 codec
     # shipped in the checkpoint's audio_tokenizer/ subfolder (~3.3 GB total).
@@ -71,7 +99,14 @@ HF_MODELS: dict[str, dict] = {
     # state-dict remap inside Pi05Model.get_submodule().
     "pi05": {"model_path_hf": "lerobot/pi05_base"},
     "qwen3_omni": {"model_path_hf": "Qwen/Qwen3-Omni-30B-A3B-Instruct"},
+    # Qwen3-TTS 12 Hz family: one class, the variant is read from config.json.
+    # CustomVoice = built-in speakers (1.7B also takes style instructions),
+    # VoiceDesign = voice described by an instruction, Base = voice cloned
+    # from reference audio.
     "qwen3_tts": {"model_path_hf": "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"},
+    "qwen3_tts_1p7b": {"model_path_hf": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"},
+    "qwen3_tts_voicedesign": {"model_path_hf": "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"},
+    "qwen3_tts_base": {"model_path_hf": "Qwen/Qwen3-TTS-12Hz-1.7B-Base"},
     # V-JEPA 2 standard (encoder + masked predictor).  Default is ViT-L @ 256
     # (~300M); the same class loads vitl/h/g at 256 or 384 by reading
     # config.json.
@@ -93,7 +128,27 @@ HF_MODELS: dict[str, dict] = {
     # Whisper works for any size; the registry key pins large-v3, the
     # standard ASR-benchmark checkpoint.
     "whisper_large": {"model_path_hf": "openai/whisper-large-v3"},
+    # Z-Image-Turbo: 8-step distilled single-stream flow DiT (Qwen3-4B caption encoder,
+    # FLUX.1 VAE), text-to-image only. Apache-2.0.
+    "z_image_turbo": {"model_path_hf": "Tongyi-MAI/Z-Image-Turbo"},
 }
+
+# qwen 3.5 family: dense (MoE TODO)
+qwen_3_5_dense_sizes = ("0.8", "2", "4", "9", "27")
+MODEL_REGISTRY.update({
+    f"qwen3_5_{size}b": ("mstar.model.qwen3_5.qwen3_5_model", "Qwen3_5DenseModel") \
+        for size in qwen_3_5_dense_sizes
+})
+HF_MODELS.update({
+    f"qwen3_5_{size}b": {"model_path_hf": f"Qwen/Qwen3.5-{size}B"} \
+        for size in qwen_3_5_dense_sizes
+})
+
+
+def model_init_kwargs(name: str) -> dict:
+    """Constructor kwargs the registry pins for ``name``: the checkpoint repo
+    and, where one repo serves several models, the variant."""
+    return {"model_path_hf": "", **HF_MODELS.get(name, {})}
 
 
 def get_model_class(name: str) -> type[Model]:

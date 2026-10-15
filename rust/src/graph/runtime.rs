@@ -11,7 +11,7 @@ use crate::tensors::{SharedBookkeeping, TensorBookkeeping};
 use crate::communicator::RawZmqCommunicator;
 use crate::PyZmqCommunicator;
 use std::sync::Arc;
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -166,6 +166,12 @@ pub struct GraphRuntime {
     /// Routing parked between complete_and_route_batch and send_outputs.
     completions: FxHashMap<u64, Completion>,
     completion_counter: u64,
+    /// Streaming ingests a prep staged, parked until commit_speculation
+    /// settles them: spec_id -> (wg, [(rid, spec node, [(slot, from_next)])]).
+    /// The wg rides along because the undo needs the same (wg, rid) pair the
+    /// prep used to reach the walk state.
+    staged_specs: FxHashMap<u32, (WgIndex, Vec<(u32, NodeId, Vec<(u8, bool)>)>)>,
+    spec_counter: u32,
 
     /// A share of the SAME bookkeeper Python handed TensorStore, taken at
     /// construction. Routing reads descriptors and adjusts refcounts through
@@ -267,12 +273,44 @@ pub struct GraphRuntime {
     /// is right for the no-transport case: the frame builders are exercised
     /// without a socket, and the worker's flag gate already refuses to pair
     /// the Rust runtime with a communicator it cannot share.
-    fn dispatch(&self, peer: &str, bytes: &[u8]) -> PyResult<()> {
-        if let Some(comm) = &self.communicator {
-            comm.send(peer, bytes)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    /// Send frames in order. Each is first tried without blocking, with the
+    /// GIL held: a send that goes through costs no GIL reacquisition, which
+    /// the released-GIL form paid at up to a millisecond per step on the
+    /// worker's main thread. From the first frame a peer cannot take (its
+    /// high-water mark), the rest go out blocking with the GIL released, as
+    /// every send did before, so a stalled peer still cannot freeze the
+    /// other Python threads.
+    fn send_frames(
+        &self, py: Python<'_>, frames: Vec<(String, Vec<u8>)>,
+    ) -> PyResult<()> {
+        let Some(comm) = &self.communicator else { return Ok(()) };
+        let mut rest: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut blocked = false;
+        for (peer, bytes) in frames {
+            if blocked {
+                rest.push((peer, bytes));
+                continue;
+            }
+            match comm.try_send(&peer, &bytes) {
+                Ok(true) => {}
+                Ok(false) => {
+                    blocked = true;
+                    rest.push((peer, bytes));
+                }
+                Err(e) => return Err(PyRuntimeError::new_err(e.to_string())),
+            }
         }
-        Ok(())
+        if rest.is_empty() {
+            return Ok(());
+        }
+        let comm = comm.clone();
+        py.allow_threads(move || -> Result<(), crate::communicator::CommError> {
+            for (peer, bytes) in &rest {
+                comm.send(peer, bytes)?;
+            }
+            Ok(())
+        })
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
     /// One WORKER_GRAPHS_DONE frame. Drains the request's pending persist
@@ -289,7 +327,7 @@ pub struct GraphRuntime {
         is_first_tp_rank: bool,
         partition_name: &str,
         stream_tokens_consumed: &[(String, i64)],
-        request_info_encoded: Option<&[u8]>,
+        publication_encoded: Option<&[u8]>,
         profiling_encoded: Option<&[u8]>,
         speculative: bool,
     ) -> PyResult<Vec<u8>> {
@@ -326,9 +364,7 @@ pub struct GraphRuntime {
             partition_done,
             stream_tokens_consumed,
             output_loop_indices: loop_indices,
-            resource_publish_info: frames::spliced_field(
-                request_info_encoded, "resource_publish_info",
-            ),
+            resource_publish_info: frames::spliced_value(publication_encoded),
             profiling: frames::split_profiling(profiling_encoded),
         };
         let bk = self.bookkeeping.lock().unwrap();
@@ -596,7 +632,7 @@ pub struct GraphRuntime {
 
         let mut out = SpecPrepOut::default();
         let mut cols = EdgeColumns::default();
-        let mut undo: Vec<(u32, Vec<(u8, bool)>)> = Vec::new();
+        let mut undo: Vec<(u32, NodeId, Vec<(u8, bool)>)> = Vec::new();
         let mut cursor = 0usize;
 
         for (i, &rid) in input.rids.iter().enumerate() {
@@ -625,7 +661,7 @@ pub struct GraphRuntime {
                 &all_refs[slice.clone()], slice.start,
             ) {
                 Some((kept, edges, ingested)) => {
-                    undo.push((rid, ingested));
+                    undo.push((rid, spec_node, ingested));
                     out.consumed_streaming_edge_idxs.extend(kept);
                     out.ready_rids.push(rid);
                     out.wg_ids.push(wg_id);
@@ -639,8 +675,8 @@ pub struct GraphRuntime {
                 None if follower => {
                     // Undo every rid prepped so far, or this rank joins the
                     // collective with a batch the leader never sent.
-                    for (done_rid, slots) in undo {
-                        self.undo_spec_ingest(wg, done_rid, spec_node, &slots);
+                    for (done_rid, node, slots) in undo {
+                        self.undo_spec_ingest(wg, done_rid, node, &slots);
                     }
                     return Ok(SpecPrepOut {
                         all_or_nothing_failed: true,
@@ -650,8 +686,24 @@ pub struct GraphRuntime {
                 None => {}
             }
         }
+        out.spec_id = self.stage_spec(wg, undo);
         out.set_edges(cols);
         Ok(out)
+    }
+
+    /// Park what a prep ingested, for `commit_speculation` to settle. 0 when
+    /// nothing was ingested: no stage to undo, so nothing to settle.
+    fn stage_spec(
+        &mut self, wg: WgIndex, undo: Vec<(u32, NodeId, Vec<(u8, bool)>)>,
+    ) -> u32 {
+        let staged: Vec<_> =
+            undo.into_iter().filter(|(_, _, s)| !s.is_empty()).collect();
+        if staged.is_empty() {
+            return 0;
+        }
+        self.spec_counter += 1;
+        self.staged_specs.insert(self.spec_counter, (wg, staged));
+        self.spec_counter
     }
 
     /// False once this rid's loop has ended: a stop is already pending, or the
@@ -711,9 +763,12 @@ pub struct GraphRuntime {
             .collect();
 
         let state = self.state_mut(wg, rid)?;
-        // Held True across the ingest so a streaming input cannot re-add the
-        // node to the ready queue underneath us.
-        state.set_spec_scheduled(spec_node, true);
+        // Held true across the ingest so a streaming input cannot re-add the
+        // node to the ready queue underneath us. Saved rather than assumed
+        // false: the node may already be in flight from a committed batch, and
+        // forcing it down below would drop that batch's protection.
+        let was_in_flight = state.is_in_flight(spec_node);
+        state.set_in_flight(spec_node, true);
 
         // ingest reports success without saying WHICH slot it used, so the
         // slot is inferred by peeking first -- the rollback removes from the
@@ -745,7 +800,8 @@ pub struct GraphRuntime {
         state.ingest_for_speculation(&g, curr_node, &source_edges);
         let ready = state.ready_for_speculation(spec_node, same_node, false);
         state.clear_speculative_inputs();
-        state.set_spec_scheduled(spec_node, false); // reset if the rid drops
+        // Restore, not force-false: the node may still be in flight.
+        state.set_in_flight(spec_node, was_in_flight);
 
         if !ready {
             for &(slot, from_next) in &ingested {
@@ -1052,6 +1108,8 @@ pub struct SendPlan {
     #[pyo3(get)] pub persist: Vec<(u32, String, Vec<u64>)>,
     /// (rid, signal, modality, tensors) -- sliced, as to_workers is.
     pub emit: Vec<(u32, String, String, Vec<TensorRef>)>,
+    /// (rid, signal, modality, value): emitted inline, one frame per step.
+    pub emit_inline: Vec<(u32, String, String, i64)>,
     /// (rid, finished worker graph ids, is_first_tp_rank)
     #[pyo3(get)] pub completed: Vec<(u32, Vec<u32>, bool)>,
     /// The pre-completion loop context, snapshotted at route time.
@@ -1066,9 +1124,9 @@ pub struct LoopStopArg {
     #[pyo3(item)] wg_fwd_pass_idx: u32,
 }
 
-/// `RouteInput`.
+/// `RouteInput`, the keys every caller sends.
 #[derive(FromPyObject)]
-pub struct RouteArg {
+struct RouteArgRequired {
     #[pyo3(item)] partition: String,
     #[pyo3(item)] graph_walk: String,
     #[pyo3(item)] node_name: String,
@@ -1076,6 +1134,54 @@ pub struct RouteArg {
     #[pyo3(item)] rids: Vec<u32>,
     #[pyo3(item)] tensors: Vec<u64>,
     #[pyo3(item)] num_tensors: Vec<usize>,
+}
+
+/// `RouteInput`.
+pub struct RouteArg {
+    partition: String,
+    graph_walk: String,
+    node_name: String,
+    output_signals: Vec<String>,
+    rids: Vec<u32>,
+    tensors: Vec<u64>,
+    num_tensors: Vec<usize>,
+    /// One output signal whose per-request value is a scalar the worker
+    /// already holds on the host (a sampled token). Its EMIT_TO_CLIENT edge
+    /// then rides inline in one frame per step instead of as a tensor per
+    /// request; `inline_values` are in `rids` order, or empty for none.
+    /// Both keys may be absent or None: a caller with no inline signal sends
+    /// the plain route input.
+    inline_signal: Option<String>,
+    inline_values: Vec<i64>,
+}
+
+/// An item of a mapping that may be missing or None.
+fn optional_item<'py, T: FromPyObject<'py>>(
+    ob: &Bound<'py, PyAny>, key: &str,
+) -> PyResult<Option<T>> {
+    match ob.get_item(key) {
+        Ok(v) if v.is_none() => Ok(None),
+        Ok(v) => v.extract().map(Some),
+        Err(e) if e.is_instance_of::<PyKeyError>(ob.py()) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+impl<'py> FromPyObject<'py> for RouteArg {
+    fn extract_bound(ob: &Bound<'py, PyAny>) -> PyResult<Self> {
+        let r: RouteArgRequired = ob.extract()?;
+        Ok(RouteArg {
+            partition: r.partition,
+            graph_walk: r.graph_walk,
+            node_name: r.node_name,
+            output_signals: r.output_signals,
+            rids: r.rids,
+            tensors: r.tensors,
+            num_tensors: r.num_tensors,
+            inline_signal: optional_item(ob, "inline_signal")?,
+            inline_values: optional_item(ob, "inline_values")?.unwrap_or_default(),
+        })
+    }
 }
 
 /// `RouteOutput`.
@@ -1147,6 +1253,9 @@ pub struct Completion {
     /// have to ask for it per rid, convert it to strings on the way out, and
     /// hand it back to be re-interned.
     pub nested: FxHashMap<u32, (Vec<Sym>, Vec<(Sym, u32)>, u32)>,
+    /// Per rid: (signal, modality, value) of the emit edge that rides inline
+    /// instead of as a tensor. Empty unless the route carried inline values.
+    pub emit_inline: FxHashMap<u32, (Sym, Sym, i64)>,
 }
 
 /// `SpeculationPrepInput`.
@@ -1175,6 +1284,8 @@ pub struct SpecPrepOut {
     #[pyo3(get)] pub tensors_per_edge: Vec<u32>,
     #[pyo3(get)] pub is_final_streaming_chunk: Vec<bool>,
     #[pyo3(get)] pub uuids: Vec<u64>,
+    /// Handle for `commit_speculation`; 0 when nothing was staged.
+    #[pyo3(get)] pub spec_id: u32,
     /// Follower path only: the batch could not be built and was rolled back.
     all_or_nothing_failed: bool,
 }
@@ -1384,6 +1495,8 @@ impl GraphRuntime {
             pending_loop_stops: FxHashSet::default(),
             completions: FxHashMap::default(),
             completion_counter: 0,
+            staged_specs: FxHashMap::default(),
+            spec_counter: 0,
             bookkeeping: bookkeeping.share(),
             communicator: communicator.map(|c| c.share()),
         })
@@ -1469,6 +1582,11 @@ impl GraphRuntime {
                     }
                 }
             }
+            let me = self.shard.me;
+            info.has_remote_workers = info
+                .node_to_workers
+                .values()
+                .any(|ws| ws.iter().any(|&w| w != me));
             // clone_empty() + setup(node_to_workers), per Python.
             info.shard = Some(
                 self.shard
@@ -1538,6 +1656,14 @@ impl GraphRuntime {
             c.speculative.remove(&rid);
             c.nested.remove(&rid);
             !c.routing.is_empty()
+        });
+
+        // Same recycling hazard for a staged speculation nobody settled: its
+        // undo would otherwise run against whichever request takes this handle
+        // next. The walk state it names is dropped just below anyway.
+        self.staged_specs.retain(|_, (_, staged)| {
+            staged.retain(|&(r, _, _)| r != rid);
+            !staged.is_empty()
         });
 
         if let Some(info) = self.requests[rid as usize].take() {
@@ -1814,6 +1940,49 @@ impl GraphRuntime {
             .collect()
     }
 
+    /// `get_dynamic_loop_iters` as four flat columns: the distinct loop names
+    /// once, then per entry the request's index in `request_ids`, the name's
+    /// index and the iteration. One string per loop name instead of one per
+    /// request per step.
+    fn get_dynamic_loop_iters_flat(
+        &self, request_ids: Vec<u32>, partition: &str,
+    ) -> (Vec<String>, Vec<u32>, Vec<u32>, Vec<u32>) {
+        let mut names: Vec<String> = Vec::new();
+        let mut name_idx_of: FxHashMap<Sym, u32> = FxHashMap::default();
+        let mut rid_idx: Vec<u32> = Vec::new();
+        let mut name_idx: Vec<u32> = Vec::new();
+        let mut iters: Vec<u32> = Vec::new();
+        let Some(p) = self.interner.get(partition) else {
+            return (names, rid_idx, name_idx, iters);
+        };
+        for (i, &rid) in request_ids.iter().enumerate() {
+            let Some(info) = self.info(rid) else { continue };
+            let Some(part) = info.partitions.get(&p) else { continue };
+            for &wg in &part.walk_worker_graphs {
+                let Some(state) = self.state(wg, rid) else {
+                    continue;
+                };
+                let g = &self.graphs[wg as usize];
+                for (lid, iter) in state.loop_indices().into_iter().enumerate() {
+                    let sym = g.lp(lid as LoopId).name;
+                    let ni = match name_idx_of.get(&sym) {
+                        Some(&n) => n,
+                        None => {
+                            let n = names.len() as u32;
+                            names.push(self.interner.name(sym).to_string());
+                            name_idx_of.insert(sym, n);
+                            n
+                        }
+                    };
+                    rid_idx.push(i as u32);
+                    name_idx.push(ni);
+                    iters.push(iter);
+                }
+            }
+        }
+        (names, rid_idx, name_idx, iters)
+    }
+
     /// No-op by construction. Python clears `tensor_info` off the node's
     /// output edges because the edges are per-request objects that carry it;
     /// here outputs are passed into `complete_and_route_batch`, so there is
@@ -2040,6 +2209,46 @@ impl GraphRuntime {
         self.prep_spec(input, false)
     }
 
+    /// Settle the streaming ingests a prep staged under `spec_id`.
+    ///
+    /// Every rid that will NOT run its speculative step -- all of them when
+    /// `!success`, otherwise those in `dropped_rids` -- has its staged ingest
+    /// undone, so the chunk leaves the slot without being dereferenced and the
+    /// caller can hand it back to its StreamBuffer. The rest are forgotten.
+    /// See `GraphRuntime.commit_speculation` for why both halves matter.
+    /// ``scheduled_rids`` are marked in flight on ``node`` in the
+    /// SAME call, so committing a speculation is one crossing rather than two.
+    /// They are passed rather than taken from the stage because a spec batch
+    /// also carries rids that staged no chunk -- fresh ones off the ready queue,
+    /// and continuing ones with nothing buffered -- which still must not be
+    /// re-queued while the step runs. One node for the batch, so one name.
+    #[pyo3(signature = (
+        spec_id, success, dropped_rids = Vec::new(),
+        node = None, wg_id = None, scheduled_rids = Vec::new(),
+    ))]
+    fn commit_speculation(
+        &mut self, spec_id: u32, success: bool, dropped_rids: Vec<u32>,
+        node: Option<String>, wg_id: Option<u32>, scheduled_rids: Vec<u32>,
+    ) -> PyResult<()> {
+        if success {
+            if let (Some(node), Some(wg_id)) = (node, wg_id) {
+                self.set_in_flight(
+                    node, wg_id, scheduled_rids, true,
+                )?;
+            }
+        }
+        let Some((wg, staged)) = self.staged_specs.remove(&spec_id) else {
+            return Ok(()); // unknown or 0: nothing was staged
+        };
+        for (rid, node, slots) in staged {
+            if success && !dropped_rids.contains(&rid) {
+                continue;
+            }
+            self.undo_spec_ingest(wg, rid, node, &slots);
+        }
+        Ok(())
+    }
+
     /// The TP-follower counterpart: ALL or nothing, no room cap, no loop
     /// filter. Rank 0 committed to this exact composition and sits on the
     /// collective until every follower joins, so one rid failing has to roll
@@ -2116,6 +2325,16 @@ impl GraphRuntime {
         let mut nested_snapshot: FxHashMap<u32, (Vec<Sym>, Vec<(Sym, u32)>, u32)> =
             FxHashMap::default();
         let mut cursor = 0usize;
+        // The emit edge of this signal carries its value inline: no staging,
+        // no per-request frame, no reference for the api server to release.
+        // A persisted signal keeps the tensor: the conductor reads it.
+        let inline_sym: Option<Sym> = input
+            .inline_signal
+            .as_deref()
+            .and_then(|s| self.interner.get(s));
+        let inline_on = inline_sym.is_some()
+            && input.inline_values.len() == input.rids.len();
+        let mut emit_inline: FxHashMap<u32, (Sym, Sym, i64)> = FxHashMap::default();
 
         for (i, &rid) in input.rids.iter().enumerate() {
             // Slice this rid's uuids back out of the flat, rid-major layout.
@@ -2157,9 +2376,9 @@ impl GraphRuntime {
                 continue;
             };
             // Before complete(), which clears the flag.
-            let was_speculative = state.is_spec_scheduled(node);
+            let was_speculative = state.is_in_flight(node);
             let completed = state.complete(&g, node, &out_tensors);
-            let pre_shard_edges = completed.edges;
+            let mut pre_shard_edges = completed.edges;
             let freed_inputs = completed.freed;
             // A loop that cached this node's outputs holds a reference on
             // each, as `Loop.maybe_cache_output` takes one. Applied before
@@ -2202,6 +2421,13 @@ impl GraphRuntime {
                     );
                 }
             }
+            // A loop-back the node never reads only feeds the loop's accumulated
+            // outputs. Dropped after persist_pre and the new-token count read it.
+            pre_shard_edges.retain(|e| {
+                !(matches!(e.dest, Dest::Local(d) if d == node)
+                    && !e.streaming
+                    && g.node(node).slot_of(e.name).is_none())
+            });
             let me_sym = self.shard.me;
             let mut edges = if let Some(info) = &self.requests[rid as usize] {
                 if let Some(sharding) = &info.shard {
@@ -2416,8 +2642,9 @@ impl GraphRuntime {
 
             // Staged before the routed edges, so a persist signal is
             // registered for a remote read whether or not the fanout kept an
-            // edge for it -- Python stages `routing.persist` unconditionally.
-            for (_name, tensors) in &persist_pre {
+            // edge for it. Skipped with no remote worker, as in Python.
+            let has_remote = self.info(rid).is_none_or(|i| i.has_remote_workers);
+            for (_name, tensors) in persist_pre.iter().filter(|_| has_remote) {
                 for t in tensors {
                     if staged.insert(t.uuid) {
                         out.register_uuids.push(t.uuid);
@@ -2457,9 +2684,19 @@ impl GraphRuntime {
                 // A tensor handled locally is not staged for a remote read;
                 // Python leaves streaming_local and the locally-ingested edge
                 // out of the register set for the same reason.
-                let remote = e.persist
+                let inline_edge = inline_on
+                    && matches!(e.dest, Dest::EmitToClient)
+                    && Some(e.name) == inline_sym
+                    && !e.persist;
+                if inline_edge {
+                    emit_inline.insert(
+                        rid, (e.name, e.modality, input.inline_values[i]),
+                    );
+                }
+                let remote = (e.persist && has_remote)
                     || e.declined_local
                     || (!is_local
+                        && !inline_edge
                         && matches!(e.dest, Dest::External(_) | Dest::EmitToClient));
                 if remote {
                     for t in &e.tensors {
@@ -2467,6 +2704,17 @@ impl GraphRuntime {
                             out.register_uuids.push(t.uuid);
                             out.register_rids.push(rid);
                         }
+                    }
+                }
+            }
+
+            // Every persisted tensor, including earlier iterations' on an accumulated
+            // output: the client's read releases them before a later walk reads them.
+            if !persist_pre.is_empty() {
+                let mut bk = self.bookkeeping.lock().unwrap();
+                for (_, tensors) in &persist_pre {
+                    for t in tensors {
+                        bk.set_persist(t.uuid, true);
                     }
                 }
             }
@@ -2503,7 +2751,11 @@ impl GraphRuntime {
                         // then nothing counted it and it goes on the wire.
                         Dest::Local(_) if e.declined_local => 1,
                         Dest::Local(_) | Dest::Empty => 0,
-                        Dest::EmitToClient => 1,
+                        // An inline emit holds no reference: nothing reads
+                        // the tensor on the api server's behalf.
+                        Dest::EmitToClient => i64::from(
+                            !(inline_on && Some(e.name) == inline_sym && !e.persist),
+                        ),
                         // One reference per destination WORKER, minus this
                         // one when the edge was already ingested into a local
                         // graph -- that copy is in local_counts. Python does
@@ -2549,12 +2801,6 @@ impl GraphRuntime {
                     *contributed.entry(t.uuid).or_insert(0) += refs;
                 }
             }
-            // Same for the persist marker: a set, built once.
-            let persisted: FxHashSet<u64> = persist_pre
-                .iter()
-                .flat_map(|(_, ts)| ts.iter().map(|t| t.uuid))
-                .collect();
-
             // Settle from the safety hold of 1 to the real fanout. persist is
             // excluded from the COUNT: those are held by the marker, and
             // counting them would double-count a signal whose destination is
@@ -2565,10 +2811,7 @@ impl GraphRuntime {
                     let count = contributed.get(&uuid).copied().unwrap_or(0);
                     // Pre-fanout: a rank whose persist edge the fanout
                     // dropped still holds the tensor for the conductor, and
-                    // an unmarked one is dereferenced to zero right here.
-                    if persisted.contains(&uuid) {
-                        bk.set_persist(uuid, true);
-                    }
+                    // an unmarked one would be dereferenced to zero right here.
                     let delta = count - 1;
                     if delta > 0 {
                         bk.increment_ref(uuid, delta)?;
@@ -2622,16 +2865,14 @@ impl GraphRuntime {
                 first_tp_rank,
                 speculative,
                 nested: nested_snapshot,
+                emit_inline,
             },
         );
         Ok(out)
     }
 
-    /// Stop loops, record the pending stops, and report who to tell.
-    ///
-    /// Returns (worker, loop names) per rid for the caller to send. The frames
-    /// are still built in Python: a Rust encoder has to reproduce the typed
-    /// msgpack wire.py emits byte for byte, which is its own piece of work.
+    /// Stop loops, record the pending stops, notify peers, and return the rids
+    /// whose loops were actually stopped.
     #[allow(clippy::type_complexity)]
     fn stop_loops_batched(
         &mut self,
@@ -2641,17 +2882,20 @@ impl GraphRuntime {
         last_node_run: &str,
         rids: Vec<u32>,
         loop_names: Vec<Vec<String>>,
-    ) -> PyResult<()> {
+    ) -> PyResult<Vec<u32>> {
         // One release for the whole batch; see send_outputs.
-        py.allow_threads(move || -> PyResult<()> {
+        // bookkeeping with the GIL held; the frames go out through send_frames
+        let mut frames: Vec<(String, Vec<u8>)> = Vec::new();
+        let out = (|| -> PyResult<Vec<u32>> {
             if rids.len() != loop_names.len() {
                 return Err(PyValueError::new_err(
                     "stop_loops_batched: rids and loop_names must be the same length",
                 ));
             }
             let Some(walk) = self.interner.get(graph_walk) else {
-                return Ok(());
+                return Ok(Vec::new());
             };
+            let mut stopped_rids = Vec::new();
             for (rid, names) in rids.into_iter().zip(loop_names) {
                 let wanted: Vec<String> = names
                     .into_iter()
@@ -2691,11 +2935,15 @@ impl GraphRuntime {
                         loop_stop_times: stop_times.clone(),
                     }
                     .encode(&self.interner);
-                    self.dispatch(self.interner.name(worker), &bytes)?;
+                    frames.push((self.interner.name(worker).to_string(), bytes));
                 }
+                stopped_rids.push(rid);
             }
-            Ok(())
-        })
+            Ok(stopped_rids)
+        })();
+        let out = out?;
+        self.send_frames(py, frames)?;
+        Ok(out)
     }
 
     /// A peer's STOP_LOOPS landing here.
@@ -2766,6 +3014,7 @@ impl GraphRuntime {
         completion_id, info_rids, request_infos,
         ntc_rids, new_token_counts,
         consumed_rids, stream_tokens_consumed, prof_rids, profiling,
+        publish_rids, publications,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn send_outputs(
@@ -2782,7 +3031,9 @@ impl GraphRuntime {
         stream_tokens_consumed: Vec<FxHashMap<String, i64>>,
         prof_rids: Vec<u32>,
         profiling: Vec<Option<Vec<u8>>>,
-    ) -> PyResult<()> {
+        publish_rids: Vec<u32>,
+        publications: Vec<Option<Vec<u8>>>,
+    ) -> PyResult<Vec<u32>> {
         // Released for the whole frame phase rather than around each send.
         // Nothing below touches Python: the arguments arrive already
         // extracted, the frames are msgpack built from the interner and the
@@ -2799,7 +3050,13 @@ impl GraphRuntime {
         // Python thread may call into this runtime while a send is in
         // flight: it would get `Already mutably borrowed` rather than block.
         // Only the worker's main loop does today.
-        py.allow_threads(move || -> PyResult<()> {
+        let t_call = std::time::Instant::now();
+        // Encoding and bookkeeping run with the GIL held (tens of
+        // microseconds); the frames go out through send_frames, which
+        // releases the GIL only for a peer at its high-water mark.
+        let mut frames: Vec<(String, Vec<u8>)> = Vec::new();
+        let t_body = std::time::Instant::now();
+        let out = (|| -> PyResult<Vec<u32>> {
             let request_infos: Vec<(u32, Option<Vec<u8>>)> =
                 info_rids.into_iter().zip(request_infos).collect();
             let new_token_counts: Vec<(u32, Vec<(String, i64)>)> = ntc_rids
@@ -2827,6 +3084,9 @@ impl GraphRuntime {
                 profiling.into_iter().collect();
             let consumed: FxHashMap<u32, Vec<(String, i64)>> =
                 stream_tokens_consumed.into_iter().collect();
+            let publications: FxHashMap<u32, Option<Vec<u8>>> =
+                publish_rids.into_iter().zip(publications).collect();
+            let mut sent_rids = Vec::new();
             let nested = std::mem::take(&mut plan.nested);
 
             // One frame per (request, worker): the plan is per edge, and a worker
@@ -2881,9 +3141,8 @@ impl GraphRuntime {
                     ));
                 }
             }
-            for (worker, bytes) in &frames_out {
-                let name = self.interner.name(*worker).to_string();
-                self.dispatch(&name, bytes)?;
+            for (worker, bytes) in frames_out {
+                frames.push((self.interner.name(worker).to_string(), bytes));
             }
 
             for (rid, signal, modality, refs) in plan.emit {
@@ -2908,13 +3167,56 @@ impl GraphRuntime {
                     }
                     .encode(&self.interner, bk.strings())
                 };
-                self.dispatch("api_server", &bytes)?;
+                frames.push(("api_server".to_string(), bytes));
+            }
+
+            // Inline emits: one RESULT_TOKENS frame per (signal, modality)
+            // per step, with the same per-request bookkeeping as a tensor
+            // emit so the completion report names the signal and its loop
+            // context. Usually one group.
+            if !plan.emit_inline.is_empty() {
+                let mut groups: Vec<((String, String), Vec<(u32, i64)>)> = Vec::new();
+                for (rid, signal, modality, value) in plan.emit_inline {
+                    let key = (signal, modality);
+                    match groups.iter_mut().find(|(k, _)| *k == key) {
+                        Some((_, items)) => items.push((rid, value)),
+                        None => groups.push((key, vec![(rid, value)])),
+                    }
+                }
+                for ((signal, modality), items) in groups {
+                    let sig = self.interner.intern(&signal);
+                    let mut request_ids: Vec<String> = Vec::with_capacity(items.len());
+                    let mut values: Vec<i64> = Vec::with_capacity(items.len());
+                    let mut loop_indices = Vec::with_capacity(items.len());
+                    for (rid, value) in items {
+                        let request_id = self.rid_name(rid)?;
+                        let idx = nested.get(&rid).cloned();
+                        if let Some(info) = self.requests[rid as usize].as_mut() {
+                            info.pending.output_signals.push(sig);
+                            if let Some(i) = idx.clone() {
+                                info.pending.set_loop_indices(sig, i);
+                            }
+                        }
+                        request_ids.push(request_id);
+                        values.push(value);
+                        loop_indices.push(idx);
+                    }
+                    let bytes = frames::ResultTokens {
+                        request_ids: &request_ids,
+                        values: &values,
+                        loop_indices: &loop_indices,
+                        signal: &signal,
+                        modality: &modality,
+                    }
+                    .encode(&self.interner);
+                    frames.push(("api_server".to_string(), bytes));
+                }
             }
 
             for (rid, signal, uuids) in plan.persist {
                 let sig = self.interner.intern(&signal);
                 if let Some(info) = self.requests[rid as usize].as_mut() {
-                    info.pending.persist.push((sig, uuids));
+                    info.pending.add_persist(sig, uuids);
                 }
             }
             for (rid, counts) in &new_token_counts {
@@ -2927,14 +3229,20 @@ impl GraphRuntime {
                 let bytes = self.worker_graphs_done_frame(
                     rid, &wg_ids, is_first_tp_rank, &partition,
                     consumed.get(&rid).map(|v| v.as_slice()).unwrap_or(&[]),
-                    encoded.get(&rid).and_then(|b| b.as_deref()),
+                    publications.get(&rid).and_then(|b| b.as_deref()),
                     profiling.get(&rid).and_then(|b| b.as_deref()),
                     spec_flags.get(&rid).copied().unwrap_or(false),
                 )?;
-                self.dispatch("conductor", &bytes)?;
+                frames.push(("conductor".to_string(), bytes));
+                sent_rids.push(rid);
             }
-            Ok(())
-        })
+            Ok(sent_rids)
+        })();
+        send_timing::record_body(t_body);
+        let out = out?;
+        self.send_frames(py, frames)?;
+        send_timing::record_total(t_call);
+        Ok(out)
     }
 
     fn get_loop_stop_times(
@@ -2968,9 +3276,10 @@ impl GraphRuntime {
     /// itself are in `frames.rs` (INPUT_SIGNALS, WORKER_GRAPHS_DONE,
     /// STOP_LOOPS).
     fn take_send_plan(&mut self, completion_id: u64) -> PyResult<SendPlan> {
-        let c = self.completions.remove(&completion_id).ok_or_else(|| {
+        let mut c = self.completions.remove(&completion_id).ok_or_else(|| {
             PyValueError::new_err(format!("unknown completion {completion_id}"))
         })?;
+        let emit_inline = std::mem::take(&mut c.emit_inline);
         let g = self.graphs[c.wg as usize].clone();
         let mut plan = SendPlan {
             partition: c.partition.clone(),
@@ -3016,12 +3325,22 @@ impl GraphRuntime {
             for e in edges {
                 let name = self.interner.name(e.name).to_string();
                 match e.dest {
-                    Dest::EmitToClient => plan.emit.push((
-                        rid,
-                        name.clone(),
-                        self.interner.name(e.modality).to_string(),
-                        e.tensors.clone(),
-                    )),
+                    Dest::EmitToClient => match emit_inline.get(&rid) {
+                        Some(&(sig, modality, value)) if sig == e.name => {
+                            plan.emit_inline.push((
+                                rid,
+                                name.clone(),
+                                self.interner.name(modality).to_string(),
+                                value,
+                            ));
+                        }
+                        _ => plan.emit.push((
+                            rid,
+                            name.clone(),
+                            self.interner.name(e.modality).to_string(),
+                            e.tensors.clone(),
+                        )),
+                    },
                     Dest::External(dest) => {
                         // `Sym::MAX` is the fanout's marker for a destination
                         // with no sharding group, i.e. one no worker runs.
@@ -3142,15 +3461,15 @@ impl GraphRuntime {
         }
     }
 
-    fn set_speculatively_scheduled(
+    fn set_in_flight(
         &mut self, node: String,
         wg_id: u32, rids: Vec<u32>,
-        speculatively_scheduled: bool,
+        in_flight: bool,
     ) -> PyResult<()> {
         let wg = self.wg_index(wg_id).ok_or_else(|| {
             PyValueError::new_err(format!("unknown worker graph id {wg_id}"))
         })?;
-        // NOT interner.get(): that is the STRING id, and set_spec_scheduled
+        // NOT interner.get(): that is the STRING id, and set_in_flight
         // wants the node's index within this worker graph. The two id spaces
         // are both u32, so only the Option here made the mix-up visible.
         let node_id = self.nid(wg, &node).ok_or_else(|| {
@@ -3160,7 +3479,7 @@ impl GraphRuntime {
         })?;
         for rid in rids {
             if let Some(state) = self.state_mut(wg, rid) {
-                state.set_spec_scheduled(node_id, speculatively_scheduled);
+                state.set_in_flight(node_id, in_flight);
             }
         }
         Ok(())
@@ -3172,8 +3491,8 @@ impl GraphRuntime {
     /// assertable from the parity tests: `State::complete` used to clear it,
     /// which let `refresh_ready` re-add a node whose rids were still in
     /// flight. Python holds the same state in
-    /// `GraphNode._speculatively_scheduled`.
-    fn is_speculatively_scheduled(
+    /// `GraphNode._in_flight`.
+    fn is_in_flight(
         &self, node: String, wg_id: u32, rid: u32,
     ) -> PyResult<bool> {
         let wg = self.wg_index(wg_id).ok_or_else(|| {
@@ -3186,7 +3505,7 @@ impl GraphRuntime {
         })?;
         Ok(self
             .state(wg, rid)
-            .map(|s| s.is_spec_scheduled(node_id))
+            .map(|s| s.is_in_flight(node_id))
             .unwrap_or(false))
     }
 }
@@ -3245,5 +3564,49 @@ mod tests {
     fn releasing_an_unknown_handle_is_ignored() {
         let mut rids = InternedRids::new();
         assert!(!rids.release(42));
+    }
+}
+
+/// Env-gated timing of `send_outputs` (MSTAR_RUST_SEND_TIMING=1): how long
+/// the GIL-free body takes against the whole call, which also pays for
+/// taking the GIL back. Printed to stderr every 500 calls.
+mod send_timing {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static BODY_NS: AtomicU64 = AtomicU64::new(0);
+    static TOTAL_NS: AtomicU64 = AtomicU64::new(0);
+    const EVERY: u64 = 500;
+
+    fn enabled() -> bool {
+        *ENABLED.get_or_init(|| {
+            std::env::var("MSTAR_RUST_SEND_TIMING").map(|v| v == "1").unwrap_or(false)
+        })
+    }
+
+    pub fn record_body(t: std::time::Instant) {
+        if enabled() {
+            BODY_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+    }
+
+    pub fn record_total(t: std::time::Instant) {
+        if !enabled() {
+            return;
+        }
+        TOTAL_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        let n = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+        if n % EVERY == 0 {
+            let body = BODY_NS.swap(0, Ordering::Relaxed) as f64;
+            let total = TOTAL_NS.swap(0, Ordering::Relaxed) as f64;
+            let per = EVERY as f64 * 1000.0;
+            eprintln!(
+                "mstar_rust send_outputs timing over {} calls: body {:.1} us, \
+                 total {:.1} us, gil reacquire {:.1} us",
+                EVERY, body / per, total / per, (total - body) / per,
+            );
+        }
     }
 }

@@ -42,8 +42,14 @@ def _edge_block(rids) -> ColumnarEdgeSpecs:
 
 
 class _FakeEngine:
-    def check_ready(self, node_name, rid, fwd_info):
+    def check_ready(self, node_name, rid, fwd_info, allow_reload=True):
+        del allow_reload
         return FULL_ADMIT_OK
+
+    def get_max_batch_size(self, node_name, graph_walk):
+        """None is no cap: a targeted call now resolves the walk's cap through
+        _room_left, and these tests are about the TP-follow FIFO, not caps."""
+        del node_name, graph_walk
 
 
 class _FakeEngineManager:
@@ -84,6 +90,11 @@ class _FakeRuntime:
 
     def __init__(self, queue=None):
         self._queue = queue
+
+    def get_rid_string(self, handle):
+        # Only ``_check_resident_set_matches`` needs this, to compare page state
+        # in wire ids; these tests drive the scheduling path, not that check.
+        return f"wire-{handle}"
 
     def get_worker_graph_id_for_node(self, node_name, graph_walk):
         return "wg0"

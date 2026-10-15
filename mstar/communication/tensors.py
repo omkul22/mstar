@@ -1,7 +1,9 @@
+import errno
 import hashlib
 import logging
 import os
 import platform
+import shutil
 import stat
 import time
 from abc import ABC, abstractmethod
@@ -38,6 +40,7 @@ from mstar.communication.communicator import (
 from mstar.communication.tensor_uuid import TensorUuidMinter
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
 from mstar.utils.ipc_format import TensorReceived, WorkerMessage, WorkerMessageType
+from mstar.utils.profiler import PHASE_PERIOD, phase_record
 
 logger = logging.getLogger(__name__)
 
@@ -133,30 +136,30 @@ class AsyncMooncakeReader:
         self.max_batch_size = max_batch_size
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
         self._pending: list[Future] = []
-        if device != "cpu":
-            self._copy_stream = torch.cuda.Stream(device=device)
-        else:
-            self._copy_stream = torch.cuda.Stream()
+        # none on the host: host buffers have no GPU work to wait for, and a stream or event would
+        # create a CUDA context on a GPU that other processes may have filled
+        self._copy_stream = torch.cuda.Stream(device=device) if torch.device(device).type == "cuda" else None
 
     def submit(self, read_info: list[TransferReadInfo]) -> Future:
         """Non-blocking: enqueue a batch of READs.
 
-        Records a CUDA event on the current stream to ensure GPU data
+        On a device, records a CUDA event on the current stream to ensure GPU data
         is ready before the background thread reads it.
         """
         if not read_info:
             return
-        event = torch.cuda.current_stream().record_event()
+        event = torch.cuda.current_stream().record_event() if self._copy_stream is not None else None
         future = self._executor.submit(self._do_read, read_info, event)
         self._pending.append(future)
         # Prune completed futures to avoid unbounded growth
         self._pending = [f for f in self._pending if not f.done()]
         return future
 
-    def _do_read(self, read_info: list["TransferReadInfo"], event: torch.cuda.Event):
+    def _do_read(self, read_info: list["TransferReadInfo"], event: torch.cuda.Event | None):
         """Worker thread: wait for GPU data via CUDA event, then PUT."""
-        self._copy_stream.wait_event(event)
-        self._copy_stream.synchronize()
+        if event is not None:
+            self._copy_stream.wait_event(event)
+            self._copy_stream.synchronize()
 
         start_time = time.perf_counter()
 
@@ -327,6 +330,9 @@ class TensorCommunicationManager(ABC):
         self.my_session_id = my_session_id
         self.enable_prof = enable_prof
         self.device = device
+        # by the manager's device, not torch.cuda.is_available() alone: a host manager holds only host tensors,
+        # and its first sync would create a CUDA context on a GPU that other processes may have filled
+        self._on_cuda = torch.cuda.is_available() and torch.device(device).type == "cuda"
         self.communicator = communicator
         self.transfer_engine = transfer_engine
         self.tensor_store = TensorStore()
@@ -351,7 +357,50 @@ class TensorCommunicationManager(ABC):
         self.buffered_shards: dict[Rid, dict[str, BufferedShards]] = {}
         self.uuid_to_shard_dim: dict[int, int | None] = {}
 
+    @property
+    def needs_cpu_tensor(self) -> bool:
+        """Whether this transport sends from host memory, so the store keeps
+        the producer's host copies (``cpu_tensors``) for the send to reuse.
+        False for transports that read device memory (TCP / RDMA)."""
+        return False
+
     # ---- shared: store ----
+    @staticmethod
+    def _host_copies_by_tensor(
+        tensors: NameToTensorList, cpu_tensors: NameToTensorList | None,
+    ) -> dict[int, torch.Tensor]:
+        """One request's host copies, keyed by ``id`` of the device tensor
+        each mirrors (matched by name and position in the producer's output).
+
+        Keyed by tensor, not name, because outputs get renamed on the way to
+        their signal (Qwen3.5 stores ``new_token`` as ``text_inputs``).
+        """
+        if not cpu_tensors:
+            return {}
+        by_tensor: dict[int, torch.Tensor] = {}
+        for name, cpu_list in cpu_tensors.items():
+            device_list = tensors.get(name)
+            if not device_list or not isinstance(cpu_list, list):
+                continue
+            for device_tensor, cpu in zip(device_list, cpu_list, strict=False):
+                by_tensor[id(device_tensor)] = cpu
+        return by_tensor
+
+    def _cpu_counterpart(
+        self, by_tensor: dict[int, torch.Tensor], tensor: torch.Tensor,
+        canonical: torch.Tensor, shard_dim: int | None,
+    ) -> torch.Tensor | None:
+        """The producer's host copy of ``tensor``, if it gave a usable one: a
+        host tensor of the same shape and dtype, else None (the send then
+        copies from the device tensor)."""
+        cpu = by_tensor.get(id(tensor))
+        if not torch.is_tensor(cpu) or cpu.device.type != "cpu":
+            return None
+        cpu = self._ensure_leading_shard_dim(shard_dim, cpu)
+        if cpu.shape != canonical.shape or cpu.dtype != canonical.dtype:
+            return None
+        return cpu
+
     def _ensure_leading_shard_dim(self, shard_dim: int | None, tensor: torch.Tensor):
         """Move ``shard_dim`` to dim 0, preserving the relative order of the
         remaining dims. The inverse is ``_undo_leading_shard_dim``."""
@@ -394,6 +443,8 @@ class TensorCommunicationManager(ABC):
         out_rids: list[int], out_uuids: list[int],
         out_tensors: list[torch.Tensor],
         out_infos: list[TensorPointerInfo] | None = None,
+        cpu_tensors: NameToTensorList | None = None,
+        out_cpu: list[torch.Tensor | None] | None = None,
     ) -> dict[str, list[TensorPointerInfo]]:
         """Mint uuids and descriptors for one request's outputs.
 
@@ -407,6 +458,10 @@ class TensorCommunicationManager(ABC):
             cfg, node_name, graph_walk,
         )
 
+        by_tensor = (
+            self._host_copies_by_tensor(tensors, cpu_tensors)
+            if out_cpu is not None else {}
+        )
         tensor_info: dict[str, list[TensorPointerInfo]] = {}
         for name, tensor_list in tensors.items():
             tensor_info[name] = []
@@ -441,6 +496,10 @@ class TensorCommunicationManager(ABC):
                 out_uuids.append(tensor_uuid)
                 out_tensors.append(canonical)
                 out_infos.append(info)
+                if out_cpu is not None:
+                    out_cpu.append(self._cpu_counterpart(
+                        by_tensor, tensor, canonical, shard_dim,
+                    ))
                 if cfg is not None:
                     self.uuid_to_shard_dim[tensor_uuid] = shard_dim
                 if self.enable_prof:
@@ -455,7 +514,13 @@ class TensorCommunicationManager(ABC):
         node_name: str | None=None,
         graph_walk: str | None=None,
         skip_cuda_sync: bool = False,
+        cpu_tensors: NameToTensorList | None = None,
     ) -> dict[str, list[TensorPointerInfo]]:
+        """Store one request's outputs and return their descriptors.
+
+        ``cpu_tensors`` mirrors ``tensors`` with host copies the caller already
+        made; they are kept only if ``needs_cpu_tensor``.
+        """
         # CUDA sync ensures GPU writes to ``tensors`` are visible before
         # callers hand out ``tensor.data_ptr()`` to peers (RDMA register,
         # SHM serialize). With same-thread async scheduling the caller
@@ -464,18 +529,184 @@ class TensorCommunicationManager(ABC):
         # step), so the unconditional default-stream sync here would
         # uselessly drain GPU(N+1). Pass ``skip_cuda_sync=True`` from
         # those call sites.
-        if not skip_cuda_sync and torch.cuda.is_available():
+        if not skip_cuda_sync and self._on_cuda:
             torch.cuda.default_stream().synchronize()
         request_ids: list[Rid] = []
         uuids: list[int] = []
         canonicals: list[torch.Tensor] = []
         infos: list[TensorPointerInfo] = []
+        want_cpu = cpu_tensors is not None and self.needs_cpu_tensor
+        cpus: list[torch.Tensor | None] | None = [] if want_cpu else None
         tensor_info = self._mint_tensor_infos(
             request_id, tensors, node_name, graph_walk,
             request_ids, uuids, canonicals, infos,
+            cpu_tensors=cpu_tensors if want_cpu else None, out_cpu=cpus,
         )
-        self.tensor_store.put_tensor_batch_multi(request_ids, uuids, canonicals, infos)
+        self.tensor_store.put_tensor_batch_multi(
+            request_ids, uuids, canonicals, infos, cpu_tensors=cpus,
+        )
         return tensor_info
+
+    def store_row_outputs_batch(
+        self,
+        request_ids: list[Rid],
+        outputs,
+        signals: list[str],
+        row_views: dict[str, tuple[torch.Tensor, ...]],
+        row_request_ids: tuple[Rid, ...],
+        node_name: str | None = None,
+        graph_walk: str | None = None,
+        host_rows=None,
+    ) -> StoredOutputs | None:
+        """``store_and_return_tensor_info_batch`` for a step whose per-request
+        outputs are views of row-addressed batch tensors (a decode step: row i
+        of ``new_token`` is request i).
+
+        The rows of one batch tensor differ only in address, so their
+        descriptors are built from one row's shape, stride and dtype instead
+        of being read off every view, and the host copies come from the stop
+        check's row buffers (``host_rows``) by index rather than being matched
+        tensor by tensor. Every (request, signal) entry must be exactly one
+        tensor that *is* a row view, or the result is None and the caller
+        takes the general path; nothing is recorded before that is settled.
+        What is stored is what the general path would store: one uuid per
+        (request, signal), request-major, the same row views.
+        """
+        if not row_views or not self.tensor_store.has_put_tensor_batch_columns:
+            return None
+        row_of = {rid: i for i, rid in enumerate(row_request_ids)}
+        sharding = self.sharding_configs
+        first_cfg = sharding.get(request_ids[0]) if request_ids else None
+        tp_size, tp_rank = self._source_tp(first_cfg, node_name, graph_walk)
+        columns = ColumnarTensorInfo(
+            source_session_id=self.my_session_id,
+            source_entity=self.my_entity_id,
+            source_node_name=node_name,
+            source_graph_walk=graph_walk,
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+        )
+        want_cpu = host_rows is not None and self.needs_cpu_tensor
+        # signal -> the row tensor it views, learned from the first request
+        # that has it and checked on every other
+        alias: dict[str, str] = {}
+        # row tensor -> (base address, row step, nbytes, ndims, dims, stride,
+        # dtype index, host rows or None)
+        template: dict[str, tuple] = {}
+        flat_uuids: list[int] = []
+        flat_rids: list[int] = []
+        signal_idxs: list[int] = []
+        num_tensors: list[int] = []
+        canonicals: list[torch.Tensor] = []
+        cpus: list[torch.Tensor | None] | None = [] if want_cpu else None
+        sharded_uuids: list[int] = []
+        mint = self._uuid_minter.mint
+        add_row = columns.add_row
+        try:
+            for rid in request_ids:
+                i = row_of.get(rid)
+                if i is None:
+                    return None
+                rid_out = outputs.get(rid)
+                cfg = sharding.get(rid)
+                if cfg is not first_cfg and self._source_tp(
+                    cfg, node_name, graph_walk,
+                ) != (tp_size, tp_rank):
+                    raise ValueError(
+                        f"request {rid} has sharding "
+                        f"{self._source_tp(cfg, node_name, graph_walk)} for "
+                        f"node {node_name!r} walk {graph_walk!r}, but the batch "
+                        f"was built for {(tp_size, tp_rank)}; one batch is one "
+                        "node on one worker and cannot mix sharding groups"
+                    )
+                for s, signal in enumerate(signals):
+                    lst = rid_out.get(signal) if rid_out else None
+                    if not lst:
+                        num_tensors.append(0)
+                        continue
+                    if type(lst) is not list or len(lst) != 1:
+                        return None
+                    tensor = lst[0]
+                    name = alias.get(signal)
+                    if name is None:
+                        for cand, views in row_views.items():
+                            if views[i] is tensor:
+                                name = cand
+                                break
+                        if name is None:
+                            return None
+                        alias[signal] = name
+                        if name not in template:
+                            template[name] = self._row_template(
+                                views, columns, host_rows if want_cpu else None, name,
+                            )
+                    elif row_views[name][i] is not tensor:
+                        return None
+                    # a sharded output is permuted on store; not a plain row
+                    if cfg is not None and cfg.shard_dim.get(signal):
+                        return None
+                    base, step, nbytes, ndims, dims, stride, dtype_idx, host = template[name]
+                    uuid = mint()
+                    flat_uuids.append(uuid)
+                    flat_rids.append(rid)
+                    signal_idxs.append(s)
+                    num_tensors.append(1)
+                    canonicals.append(tensor)
+                    add_row(uuid, base + i * step, nbytes, ndims, dims, stride, dtype_idx)
+                    if want_cpu:
+                        cpus.append(host[i] if host is not None else None)
+                    if cfg is not None:
+                        sharded_uuids.append(uuid)
+        except IndexError:
+            # a row index past the views or the host rows: not this batch's rows
+            return None
+        # nothing above touched shared state; from here the general path's
+        # guarantees apply
+        shard_dims = self.uuid_to_shard_dim
+        for uuid in sharded_uuids:
+            shard_dims[uuid] = None
+        edge_names = self.uuid_to_edge_name
+        if self.enable_prof:
+            for uuid, s in zip(flat_uuids, signal_idxs, strict=True):
+                edge_names[uuid] = signals[s]
+        try:
+            self.tensor_store.put_tensor_batch_columns(
+                flat_rids, canonicals, columns, cpu_tensors=cpus,
+            )
+        except Exception:
+            for uuid in flat_uuids:
+                shard_dims.pop(uuid, None)
+                edge_names.pop(uuid, None)
+            raise
+        return StoredOutputs(flat_uuids, flat_rids, signal_idxs, num_tensors)
+
+    @staticmethod
+    def _row_template(
+        views: tuple[torch.Tensor, ...], columns: ColumnarTensorInfo,
+        host_rows, name: str,
+    ) -> tuple:
+        """What every row of one batch tensor shares, for the row store: the
+        first row's address and the step to the next, byte size, shape,
+        stride and dtype index, plus the matching host rows (one view per row)
+        when ``host_rows`` carries a buffer of this name with the rows' shape
+        and dtype."""
+        first = views[0]
+        base = first.data_ptr()
+        step = views[1].data_ptr() - base if len(views) > 1 else 0
+        dims = tuple(first.shape)
+        host = None
+        if host_rows is not None:
+            buf = host_rows.buffers.get(name)
+            if (
+                torch.is_tensor(buf) and buf.device.type == "cpu"
+                and buf.dim() == len(dims) and buf.dtype == first.dtype
+                and tuple(buf.shape[1:]) == dims[1:] and buf.shape[0] >= len(views)
+            ):
+                host = buf.split(1)
+        return (
+            base, step, first.nbytes, len(dims), dims, tuple(first.stride()),
+            columns.dtype_index(first.dtype), host,
+        )
 
     def store_and_return_tensor_info_batch(
         self,
@@ -485,6 +716,7 @@ class TensorCommunicationManager(ABC):
         node_name: str | None=None,
         graph_walk: str | None=None,
         skip_cuda_sync: bool = False,
+        cpu_tensors: dict[Rid, NameToTensorList] | None = None,
     ) -> StoredOutputs:
         """Store a whole output batch and return the columns routing needs.
 
@@ -501,8 +733,12 @@ class TensorCommunicationManager(ABC):
         Outputs under a name no signal carries are not stored at all: no edge
         will ever read them, and a stored tensor nothing references is only
         freed when its request is torn down.
+
+        ``cpu_tensors`` mirrors ``outputs`` with host copies the caller already
+        made (e.g. the stop check's), matched as in ``_host_copies_by_tensor``;
+        kept only if ``needs_cpu_tensor``.
         """
-        if not skip_cuda_sync and torch.cuda.is_available():
+        if not skip_cuda_sync and self._on_cuda:
             torch.cuda.default_stream().synchronize()
 
         flat_uuids: list[int] = []
@@ -510,6 +746,8 @@ class TensorCommunicationManager(ABC):
         signal_idxs: list[int] = []
         num_tensors: list[int] = []
         canonicals: list[torch.Tensor] = []
+        want_cpu = cpu_tensors is not None and self.needs_cpu_tensor
+        cpus: list[torch.Tensor | None] | None = [] if want_cpu else None
 
         columnar = self.tensor_store.has_put_tensor_batch_columns
         infos: list[TensorPointerInfo] = []
@@ -534,6 +772,11 @@ class TensorCommunicationManager(ABC):
         try:
             for request_id in request_ids:
                 tensors = outputs.get(request_id) or {}
+                by_tensor = (
+                    self._host_copies_by_tensor(
+                        tensors, cpu_tensors.get(request_id),
+                    ) if want_cpu else {}
+                )
                 cfg = self.sharding_configs.get(request_id)
                 source_tp_size, source_tp_rank = self._source_tp(
                     cfg, node_name, graph_walk,
@@ -567,6 +810,10 @@ class TensorCommunicationManager(ABC):
                         flat_rids.append(request_id)
                         signal_idxs.append(i)
                         canonicals.append(canonical)
+                        if want_cpu:
+                            cpus.append(self._cpu_counterpart(
+                                by_tensor, tensor, canonical, shard_dim,
+                            ))
                         if not columnar:
                             infos.append(self._tensor_info(
                                 canonical, tensor_uuid, source_tp_size,
@@ -581,11 +828,11 @@ class TensorCommunicationManager(ABC):
             if columnar:
                 columns.add_tensors_canonical(flat_uuids, canonicals)
                 self.tensor_store.put_tensor_batch_columns(
-                    flat_rids, canonicals, columns,
+                    flat_rids, canonicals, columns, cpu_tensors=cpus,
                 )
             else:
                 self.tensor_store.put_tensor_batch_multi(
-                    flat_rids, flat_uuids, canonicals, infos,
+                    flat_rids, flat_uuids, canonicals, infos, cpu_tensors=cpus,
                 )
         except Exception:
             # The per-tensor bookkeeping above is written before the store
@@ -824,8 +1071,13 @@ class TensorCommunicationManager(ABC):
         ready: dict[Rid, list[GraphEdge]] = {}
         still_pending = []
         uuid_to_time = {}
+        # the async reader finishes a request's reads in any order, so a read
+        # that is done waits for the ones started before it: a streamed token
+        # must not reach the client ahead of the one before it
+        waiting: set[Rid] = set()
         for ep in self.pending:
-            if ep.future is None or ep.future.done():
+            done = ep.future is None or ep.future.done()
+            if done and ep.request_id not in waiting:
                 if ep.future is not None:
                     ep.future.result()
                 for edge in ep.graph_edges:
@@ -838,6 +1090,7 @@ class TensorCommunicationManager(ABC):
                         for info in edge.tensor_info:
                             uuid_to_time[info.uuid] = ep.rx_time
             else:
+                waiting.add(ep.request_id)
                 still_pending.append(ep)
         self.pending = still_pending
 
@@ -1127,7 +1380,7 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
         )
 
     def register_for_send(self, request_id, tensor_infos, skip_cuda_sync=False):
-        if not skip_cuda_sync:
+        if not skip_cuda_sync and self._on_cuda:
             torch.cuda.default_stream().synchronize()
         for info in tensor_infos:
             self._register_one(request_id, info.uuid)
@@ -1140,7 +1393,7 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
         """Uuid-driven form. Registration here reads nothing off a descriptor
         but the uuid -- the tensor itself comes from the store -- so taking
         uuids avoids rebuilding one per tensor."""
-        if not skip_cuda_sync:
+        if not skip_cuda_sync and self._on_cuda:
             torch.cuda.default_stream().synchronize()
         for request_id, uuids in per_request:
             for uuid in uuids:
@@ -1158,6 +1411,10 @@ class MooncakeCommunicationManager(TensorCommunicationManager):
             ret_value = self.transfer_engine.register_memory(
                 tensor.data_ptr(), tensor.nbytes
             )
+            if PHASE_PERIOD:
+                phase_record(
+                    "tensors.register_memory", time.perf_counter() - t0,
+                )
             if ret_value != 0:
                 raise RuntimeError(
                     f"Mooncake memory registration failed for request id "
@@ -1288,6 +1545,10 @@ def _deserialize_tensor(
     return t
 
 
+# Docker gives a container 64 MB of /dev/shm, and one video or audio tensor can outgrow that
+_SHM_DIR_WARN_BYTES = 1 << 30
+
+
 def _default_shm_dir() -> str:
     """Return the default shared-memory directory for the current platform."""
     if platform.system() == "Linux" and os.path.isdir("/dev/shm"):
@@ -1346,6 +1607,17 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
 
         self.shm_dir = shm_dir or _default_shm_dir()
         os.makedirs(self.shm_dir, exist_ok=True)
+        # at boot, not at the first large send: that failure would be the only other sign of a small dir
+        try:
+            st = os.statvfs(self.shm_dir)
+            shm_total = st.f_frsize * st.f_blocks
+        except OSError:
+            shm_total = None
+        if shm_total is not None and shm_total < _SHM_DIR_WARN_BYTES:
+            logger.warning(
+                "SHM: %s holds only %d MiB and every tensor in flight is written there, so a large one will "
+                "fail its send with ENOSPC. Give it more room (docker --shm-size), or pass "
+                "--tensor-comm-protocol TCP, which is slower", self.shm_dir, shm_total >> 20)
 
         # uuid → file path for sender-side cleanup
         self._shm_files: dict[int, str] = {}
@@ -1358,6 +1630,18 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
         if torch.cuda.is_available() and str(device) != "cpu":
             self._d2h_stream = torch.cuda.Stream(device=device)
             self._h2d_stream = torch.cuda.Stream(device=device)
+
+    @property
+    def needs_cpu_tensor(self) -> bool:
+        # The send is a host write, so a host copy the producer already made
+        # saves the device-to-host copy here.
+        return True
+
+    def _send_source(self, uuid: int) -> torch.Tensor:
+        """What to serialize for ``uuid``: the stored host copy if there is
+        one, else the device tensor (which the write copies down)."""
+        cpu = self.tensor_store.get_cpu_tensor(uuid)
+        return cpu if cpu is not None else self.tensor_store.get_tensor(uuid)
 
     def _shm_path(self, entity_id: str, uuid: int) -> str:
         ns = f"{self._shm_namespace}_" if self._shm_namespace else ""
@@ -1404,11 +1688,40 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
                     "deployment's namespace"
                 ) from None
 
+    def _write_shm_file(self, path: str, data: bytes) -> None:
+        """Write one tensor's bytes to ``path``.
+
+        A full shm dir fails the write part way, and no cleanup knows the partial file: left behind, it
+        would keep the space it took, and the next request would find the dir fuller still.
+        """
+        try:
+            with self._create_shm_file(path) as f:
+                f.write(data)
+        except OSError as exc:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+            if exc.errno != errno.ENOSPC:
+                raise
+            free = shutil.disk_usage(self.shm_dir).free
+            if free < len(data):
+                reason = f"{self.shm_dir} has {free} bytes free, too few for a {len(data)}-byte tensor"
+            else:
+                reason = (
+                    f"{self.shm_dir} reported no space for a {len(data)}-byte tensor, with {free} bytes free after "
+                    "the failed write: it may be out of inodes, or other writers held the space meanwhile"
+                )
+            raise OSError(
+                errno.ENOSPC,
+                f"{reason}. Give it more room (docker --shm-size), or pass --tensor-comm-protocol TCP, which is slower",
+            ) from exc
+
     def register_for_send(
         self, request_id: Rid, tensor_infos: list[TensorPointerInfo],
         skip_cuda_sync: bool = False,
     ):
-        if not skip_cuda_sync and torch.cuda.is_available():
+        if not skip_cuda_sync and self._on_cuda:
             torch.cuda.default_stream().synchronize()
         # Producer's completion event is already waited on upstream, so the
         # source tensors are device-visible on entry. Running the D2H on a
@@ -1430,7 +1743,7 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
     ):
         """Uuid-driven form. This path reads nothing off a descriptor but the
         uuid, so taking uuids avoids rebuilding one per tensor."""
-        if not skip_cuda_sync and torch.cuda.is_available():
+        if not skip_cuda_sync and self._on_cuda:
             torch.cuda.default_stream().synchronize()
         ctx = (
             torch.cuda.stream(self._d2h_stream)
@@ -1447,12 +1760,11 @@ class SharedMemoryCommunicationManager(TensorCommunicationManager):
         CUDA sync and the copy-stream context."""
         if self.tensor_store.is_registered(uuid):
             return
-        tensor = self.tensor_store.get_tensor(uuid)
+        tensor = self._send_source(uuid)
         t0 = time.perf_counter()
         data = _serialize_tensor(tensor)
         path = self._shm_path(self.my_entity_id, uuid)
-        with self._create_shm_file(path) as f:
-            f.write(data)
+        self._write_shm_file(path, data)
         self._shm_files[uuid] = path
         self.tensor_store.set_metadata(uuid, mem_registered=True)
         if self.enable_prof:

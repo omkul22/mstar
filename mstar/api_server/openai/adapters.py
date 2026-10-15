@@ -24,18 +24,22 @@ OpenAI-capable models opt in by adding an adapter and registering it in
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import math
+import re
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from mstar.api_server import media_io
 from mstar.model.multimodal import PromptPart
+from mstar.model.registry import qwen_3_5_dense_sizes as QWEN_3_5_DENSE_SIZES
 
 if TYPE_CHECKING:  # for type checkers / IDEs only (annotations are lazy via __future__)
     from mstar.api_server.openai.protocol import (
         ChatCompletionRequest,
         ImageGenerationRequest,
         SpeechRequest,
+        TranscriptionRequest,
         VideoGenerationRequest,
     )
 
@@ -52,6 +56,25 @@ class SubmitArgs:
     prompt_parts: list[PromptPart] | None = None
 
 
+@dataclass
+class Transcript:
+    """A finished transcription as the serving layer reports it.
+
+    ``text`` is the clean transcript. ``language`` is an ISO-639-1 code when the
+    model reported one (detected or forced). ``segments`` / ``words`` carry
+    ``{"start", "end", "text"}`` / ``{"start", "end", "word"}`` in seconds when
+    the model emitted timestamps; empty otherwise. ``unfinished`` says the
+    output stopped inside a segment (a start timestamp with no end): the text
+    after the last closed segment is provisional, and a long-form driver
+    re-decodes that audio from the last segment end.
+    """
+    text: str
+    language: str | None = None
+    segments: list[dict] = field(default_factory=list)
+    words: list[dict] = field(default_factory=list)
+    unfinished: bool = False
+
+
 def flatten_messages(
     messages: list, upload_dir: Path, allow_remote: bool = True
 ) -> tuple[str | None, dict[str, list[str]], list[str], list[PromptPart]]:
@@ -60,37 +83,46 @@ def flatten_messages(
     ``parts`` is the ordered sequence as written; the other three derive from
     it — text newline-joined, attachments persisted under ``upload_dir`` and
     grouped by modality, ``input_modalities`` the per-part modality sequence.
-    So an attachment's position and a repeated modality both survive.
-    (Multi-turn role structure is flattened — a v1 simplification; the models
-    apply their own prompt formatting in ``process_prompt``.)
+    So an attachment's position and a repeated modality both survive. Each
+    text part carries its message's role, so a reply stays its own turn.
     """
     parts: list[PromptPart] = []
     file_paths: dict[str, list[str]] = {}
 
     def add_file(modality: str, path: str) -> None:
+        # shortcut: always a user turn, so the model can't tell an image it made from one it was
+        # sent, and a reply that is only an image leaves no assistant turn; a feature like
+        # multi-turn editing would give the turn break between two attachments a text slot
         paths = file_paths.setdefault(modality, [])
-        parts.append(PromptPart(modality=modality, index=len(paths)))
+        parts.append(PromptPart(modality=modality, index=len(paths), role="user"))
         paths.append(path)
 
-    def add_text(text: str) -> None:
+    def add_text(text: str, role: str) -> None:
         # Adjacent text parts were newline-joined before ordering was kept;
-        # merge them here so only text an attachment separates gets its own
-        # part, and the rendered prompt keeps the separator it used to have.
-        if parts and parts[-1].modality == "text":
-            parts[-1] = PromptPart(
-                modality="text", text=f"{parts[-1].text}\n{text}"
-            )
+        # merge them here, across messages of one role too (the layout has no
+        # slot for the boundary between them), so only text an attachment or a
+        # role change separates gets its own part, and the rendered prompt
+        # keeps the separator it used to have.
+        if parts and parts[-1].modality == "text" and parts[-1].role == role:
+            parts[-1] = replace(parts[-1], text=f"{parts[-1].text}\n{text}")
             return
-        parts.append(PromptPart(modality="text", text=text))
+        parts.append(PromptPart(modality="text", text=text, role=role))
 
     for msg in messages or []:
         # Messages may be pydantic ChatMessage objects or plain dicts.
-        content = msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", None)
+        if isinstance(msg, dict):
+            role, content = msg.get("role"), msg.get("content")
+        else:
+            role, content = getattr(msg, "role", None), getattr(msg, "content", None)
+        if role == "developer":  # OpenAI's newer name for system
+            role = "system"
+        elif role not in ("system", "user", "assistant"):
+            raise ValueError(f"a message's role must be system, developer, user or assistant, not {role!r}")
         if content is None:
             continue
         if isinstance(content, str):
             if content:
-                add_text(content)
+                add_text(content, role)
             continue
         for part in content:
             if not isinstance(part, dict):
@@ -98,7 +130,7 @@ def flatten_messages(
             ptype = part.get("type")
             if ptype == "text":
                 if part.get("text"):
-                    add_text(part["text"])
+                    add_text(part["text"], role)
             elif ptype == "image_url":
                 url = (part.get("image_url") or {}).get("url", "")
                 if url:
@@ -131,6 +163,29 @@ def _passthrough(req) -> dict:
     flow through verbatim as model_kwargs."""
     extra = getattr(req, "model_extra", None) or {}
     return dict(extra)
+
+
+def _refuse_tool_calls(req) -> None:
+    """Refuse a chat that asks the model to call a tool.
+
+    No adapter here parses a tool call out of a reply, so a client sent plain
+    text takes it for the model declining every tool. An empty ``tools`` and a
+    ``tool_choice`` of ``none`` or ``auto`` ask for no call; clients send them
+    by default. A ``tool_choice`` of ``none`` asks for no call even when
+    ``tools`` lists some. Their older names, ``functions`` and
+    ``function_call``, follow the same rules.
+    """
+    extra = req.model_extra or {}
+    choice = extra.get("tool_choice")
+    function_call = extra.get("function_call")
+    if (
+        (extra.get("tools") not in (None, []) and choice != "none")
+        or (extra.get("functions") not in (None, []) and function_call != "none")
+        or choice == "required"
+        or isinstance(choice, dict)
+        or function_call not in (None, "none", "auto")
+    ):
+        raise ValueError("tool calling is not supported for this model")
 
 
 def _apply_sampling(
@@ -184,6 +239,39 @@ class OpenAIAdapter:
     supports_images: bool = False   # POST /v1/images/generations and /v1/images/edits
     supports_videos: bool = False   # POST /v1/videos/generations
     supports_realtime: bool = False  # /v1/realtime (bidirectional speech WebSocket)
+    supports_transcriptions: bool = False  # POST /v1/audio/transcriptions
+    # Longest clip the model transcribes in one request. Longer uploads are cut
+    # into windows of this length by the transcription route (None means unlimited).
+    max_audio_seconds: float | None = None
+    # How the windows of a long upload run: "sequential" feeds each window the
+    # previous transcript as ``initial_prompt`` (openai-whisper's carry-over),
+    # "parallel" submits them all at once. A request can override with
+    # ``long_form`` in extra_body.
+    long_form: str = "sequential"
+    # Sequential long form: decode every window with timestamps and start the
+    # next one where the last closed segment ended, instead of at a fixed
+    # boundary (openai-whisper's seek). Needs ``parse_transcript`` to report
+    # segments and ``unfinished``.
+    seeks_by_timestamps: bool = False
+    # Sequential long form: a window whose text compresses better than this
+    # (gzip bytes ratio) is a repetition loop and is decoded again at rising
+    # temperatures (openai-whisper's fallback). None disables the check.
+    compression_ratio_threshold: float | None = 2.4
+    # Streaming transcription over /v1/realtime: the model must be able to
+    # continue a hypothesis it is handed (see ``realtime_step_request``).
+    supports_realtime_transcription: bool = False
+
+    # ``/v1/audio/speech`` sentence chunking (``serving_speech``): inputs of at
+    # least ``speech_chunk_min_chars`` characters are split into sentence
+    # groups of about ``speech_chunk_max_chars`` and synthesized as ordered
+    # sub-requests. ``None`` keeps the whole text in one request unless the
+    # client sends ``sentence_chunking: true``.
+    speech_chunk_min_chars: int | None = None
+    speech_chunk_max_chars: int = 400
+    # sub-requests kept in flight ahead of the one being streamed
+    speech_chunk_lookahead: int = 2
+    # most sub-requests one input may split into; longer inputs get a 400
+    speech_chunk_max_pieces: int = 32
 
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:  # noqa: ARG002
         # Output modalities vary by model: e.g. Qwen3-Omni speech output also
@@ -202,6 +290,29 @@ class OpenAIAdapter:
     def image_edit_to_request(self, prompt: str, image_path: str, extra_kwargs: dict) -> SubmitArgs:  # noqa: ARG002
         raise NotImplementedError("image editing is not supported by this model")
 
+    def transcription_to_request(self, req: TranscriptionRequest, audio_path: str) -> SubmitArgs:  # noqa: ARG002
+        raise NotImplementedError("audio/transcriptions is not supported by this model")
+
+    def parse_transcript(self, text: str, req: TranscriptionRequest) -> Transcript:  # noqa: ARG002
+        """Structured view of a model's raw text stream. The default is plain
+        text; a model whose stream carries control tokens (Whisper's language
+        and timestamp tokens, an LLM decoder's tags) parses them here."""
+        return Transcript(text=text.strip())
+
+    def stream_text(self, raw: str) -> str:
+        """The client-facing text of the raw stream so far. It must only
+        grow as ``raw`` does, so a model with control tokens strips them and
+        holds back a tail that may still turn out to be one. The default
+        passes the text through."""
+        return raw
+
+    def realtime_step_request(self, req: TranscriptionRequest, audio_path: str, prefix: str) -> SubmitArgs:  # noqa: ARG002
+        """One streaming step: transcribe ``audio_path`` (everything heard so
+        far) continuing from ``prefix``, the stable part of the previous raw
+        hypothesis. Models that cannot continue a hypothesis leave this
+        unimplemented and stay off ``/v1/realtime``."""
+        raise NotImplementedError("realtime transcription is not supported by this model")
+
 
 class BagelAdapter(OpenAIAdapter):
     """BAGEL: text chat (text out) + text-to-image / image editing.
@@ -215,6 +326,7 @@ class BagelAdapter(OpenAIAdapter):
     supports_images = True
 
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
+        _refuse_tool_calls(req)
         text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir)
         mk = _passthrough(req)
         _apply_sampling(req, mk)
@@ -272,6 +384,7 @@ class Qwen3OmniAdapter(OpenAIAdapter):
         return getattr(req, "voice", None)
 
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
+        _refuse_tool_calls(req)
         text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir)
         mk = _passthrough(req)
         # Speech output also emits text, so request both modalities when audio is asked for.
@@ -306,6 +419,36 @@ class Qwen3OmniAdapter(OpenAIAdapter):
         )
 
 
+class Qwen3_5Adapter(OpenAIAdapter):
+    """Qwen3.5: text-and-image chat, text out.
+
+    Chat only; the other ``/v1/*`` surfaces stay 404. Sampling keys:
+    ``temperature``, ``top_p``, ``max_output_tokens`` and ``seed``, plus two
+    non-OpenAI fields via ``extra_body``:
+
+    * ``repetition_penalty`` — the sampler applies it over the prompt's tokens
+      as well as the generated ones.
+    * ``enable_thinking`` (default true) — the chat template opens a
+      ``<think>`` block. Set it false for short answers.
+    """
+
+    supports_chat = True
+
+    def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
+        _refuse_tool_calls(req)
+        text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir)
+        mk = _passthrough(req)
+        _apply_sampling(req, mk)
+        return SubmitArgs(
+            text=text,
+            file_paths=file_paths or None,
+            input_modalities=in_mods,
+            output_modalities=["text"],
+            model_kwargs=mk,
+            prompt_parts=parts,
+        )
+
+
 class OrpheusAdapter(OpenAIAdapter):
     """Orpheus: text-to-speech (audio out only). Honors temperature/top_p/seed
     (its ``get_sampling_config`` reads model_kwargs)."""
@@ -323,7 +466,6 @@ class OrpheusAdapter(OpenAIAdapter):
             output_modalities=["audio"],
             model_kwargs=mk,
         )
-
 
 
 class OmniVoiceAdapter(OpenAIAdapter):
@@ -382,6 +524,61 @@ class OmniVoiceAdapter(OpenAIAdapter):
         )
 
 
+class Qwen3TTSAdapter(OpenAIAdapter):
+    """Qwen3-TTS (CustomVoice / VoiceDesign / Base): text-to-speech, audio only.
+
+    ``voice`` selects a built-in speaker (CustomVoice). ``instructions`` (the
+    OpenAI field; ``instruct`` also accepted) carries the style or voice
+    description. Non-standard knobs travel through ``extra_body``:
+    ``language``, ``non_streaming_mode``, ``top_k``, ``repetition_penalty``,
+    the residual-group ``subtalker_*`` sampling, ``max_new_tokens``.
+    ``temperature`` / ``top_p`` / ``seed`` map onto the Talker sampler.
+
+    Inputs of 600+ characters are synthesized as ordered sentence chunks
+    (``serving_speech``): each Talker request stays near the lengths the
+    model was trained on and the chunks batch like independent requests.
+    Benchmark sentences (5-40 words) never reach the threshold.
+    """
+
+    supports_speech = True
+    speech_chunk_min_chars = 600
+    speech_chunk_max_chars = 400
+
+    def speech_to_request(self, req: SpeechRequest, upload_dir: Path) -> SubmitArgs:
+        mk = _passthrough(req)
+        if getattr(req, "voice", None):
+            mk["voice"] = req.voice
+        # OpenAI's field is ``instructions``; the model reads ``instruct``.
+        instructions = mk.pop("instructions", None)
+        if instructions:
+            mk.setdefault("instruct", instructions)
+        _apply_sampling(req, mk, temperature_key="temperature", top_p_key="top_p", max_tokens_key=None)
+        # Voice clone (Base): ``ref_audio`` is a data URL, an http(s) URL, a
+        # local path or bare base64 (vLLM-Omni's field). It becomes the
+        # request's audio input for one request; ``ref_text`` and
+        # ``x_vector_only_mode`` ride along as model kwargs. Named, persisted
+        # voices come with the shared voice registry (engine/voice-registry).
+        ref_audio = mk.pop("ref_audio", None)
+        if ref_audio:
+            if ref_audio.startswith(("data:", "http://", "https://")) or Path(ref_audio).suffix:
+                _, path = media_io.resolve_media_ref(ref_audio, upload_dir)
+            else:
+                _, path = media_io.save_base64(ref_audio, "wav", "audio", upload_dir)
+            return SubmitArgs(
+                text=req.input,
+                file_paths={"audio": [path]},
+                input_modalities=["audio", "text"],
+                output_modalities=["audio"],
+                model_kwargs=mk,
+            )
+        return SubmitArgs(
+            text=req.input,
+            input_modalities=["text"],
+            output_modalities=["audio"],
+            model_kwargs=mk,
+        )
+
+
 class KokoroAdapter(OpenAIAdapter):
     """Kokoro-82M: text-to-speech, audio out only.
 
@@ -406,6 +603,60 @@ class KokoroAdapter(OpenAIAdapter):
         return SubmitArgs(
             text=req.input,
             input_modalities=["text"],
+            output_modalities=["audio"],
+            model_kwargs=mk,
+        )
+
+
+def _refuse_server_path(ref: str, upload_dir: Path) -> None:
+    """A plain path must name a file the server stored itself, under
+    ``upload_dir``; checked before anything is opened, so it cannot probe the disk."""
+    if not isinstance(ref, str):
+        raise ValueError(f"ref_audio must be a data URL or an http(s) URL, got {type(ref).__name__}")
+    if ref.startswith("data:") or ref.split(":", 1)[0].lower() in ("http", "https"):
+        return
+    if not Path(ref).resolve().is_relative_to(Path(upload_dir).resolve()):
+        raise ValueError(
+            "ref_audio must be a data URL or an http(s) URL; paths on the server are refused"
+        )
+
+
+class ChatterboxAdapter(OpenAIAdapter):
+    """Chatterbox / Chatterbox-Turbo: zero-shot TTS with voice cloning.
+
+    ``voice`` is either ``"default"`` (the voice shipped with the checkpoint)
+    or the name of a preset clip in the deployment's ``voices_dir``. A
+    reference clip for cloning comes through ``ref_audio`` in ``extra_body``
+    (a data URL or, when the server allows it, an http(s) URL; paths on the
+    server are refused) and is loaded by the worker like an uploaded file.
+    The model's own knobs --
+    ``exaggeration``, ``cfg_weight``, ``min_p``, ``repetition_penalty``,
+    ``top_k``, ``n_cfm_timesteps``, ``watermark``, ``max_new_tokens`` and, for
+    the multilingual checkpoint, ``language_id`` -- pass through ``extra_body``
+    verbatim; ``temperature``/``top_p``/``seed`` are the standard fields.
+    ``speed`` is not a Chatterbox control and is dropped.
+    """
+
+    supports_speech = True
+
+    def speech_to_request(self, req: SpeechRequest, upload_dir: Path) -> SubmitArgs:
+        mk = _passthrough(req)
+        if getattr(req, "voice", None):
+            mk.setdefault("voice", req.voice)
+        _apply_sampling(req, mk, temperature_key="temperature", top_p_key="top_p", max_tokens_key=None)
+        file_paths = None
+        input_modalities = ["text"]
+        ref_audio = mk.pop("ref_audio", None)
+        if ref_audio:
+            _refuse_server_path(ref_audio, upload_dir)
+            # a URL is fetched only when the server allows it (MSTAR_ALLOW_REMOTE)
+            _mime, path = media_io.resolve_media_ref(ref_audio, upload_dir, allow_remote=False)
+            file_paths = {"audio": [path]}
+            input_modalities = ["text", "audio"]
+        return SubmitArgs(
+            text=req.input,
+            file_paths=file_paths,
+            input_modalities=input_modalities,
             output_modalities=["audio"],
             model_kwargs=mk,
         )
@@ -496,6 +747,7 @@ class Cosmos3EdgeAdapter(Cosmos3Adapter):
     supports_chat = True
 
     def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
+        _refuse_tool_calls(req)
         text, file_paths, in_mods, parts = flatten_messages(req.messages, upload_dir)
         mk = _passthrough(req)
         _apply_sampling(req, mk)
@@ -567,13 +819,232 @@ class Wan22Adapter(OpenAIAdapter):
         )
 
 
+class DiffusionImageAdapter(OpenAIAdapter):
+    """Generic adapter for the DiT-scaffold image models (FLUX.2 klein, Z-Image, ...):
+    text-to-image and reference-image editing.
+
+    ``size`` ("WxH") maps to the models' ``width`` / ``height`` kwargs; ``seed`` is
+    honoured by the conductor; every other knob (``num_inference_steps``,
+    ``guidance_scale`` on models that take it, ``negative_prompt``) passes through
+    ``extra_body``. ``n`` is served as ``n`` concurrent requests by the images handler,
+    which the equal-shape batching then runs together.
+    """
+
+    supports_images = True
+
+    @staticmethod
+    def _size_kwargs(size: str | None, mk: dict) -> None:
+        if not size:
+            return
+        try:
+            width, height = (int(v) for v in size.lower().split("x"))
+        except ValueError:
+            raise ValueError(f"size must be 'WxH' (e.g. '1024x1024'); got {size!r}") from None
+        mk.setdefault("width", width)
+        mk.setdefault("height", height)
+
+    def image_to_request(self, req: ImageGenerationRequest, upload_dir: Path) -> SubmitArgs:  # noqa: ARG002
+        mk = _passthrough(req)
+        self._size_kwargs(getattr(req, "size", None), mk)
+        if getattr(req, "seed", None) is not None:
+            mk.setdefault("seed", req.seed)
+        return SubmitArgs(
+            text=req.prompt,
+            input_modalities=["text"],
+            output_modalities=["image"],
+            model_kwargs=mk,
+        )
+
+    def image_edit_to_request(self, prompt: str, image_path: str, extra_kwargs: dict) -> SubmitArgs:
+        mk = dict(extra_kwargs or {})
+        self._size_kwargs(mk.pop("size", None), mk)
+        return SubmitArgs(
+            text=prompt,
+            file_paths={"image": [image_path]},
+            input_modalities=["image", "text"],
+            output_modalities=["image"],
+            model_kwargs=mk,
+        )
+
+# Whisper-style control tokens: ``<|en|>`` (language), ``<|12.34|>`` (timestamp),
+# and the task/format markers. ASR models render the ones that carry
+# information (language, timestamps) into their text stream so the adapter can
+# lift them out here. Everything else is dropped.
+_CONTROL_TOKEN = re.compile(r"<\|([^|<>]*)\|>")
+# a control token cut off by the end of the stream so far
+_PARTIAL_CONTROL_TOKEN = re.compile(r"<(\|[^|<>]*\|?)?$")
+_TIMESTAMP = re.compile(r"^\d+\.\d{2}$")
+_LANGUAGE = re.compile(r"^[a-z]{2,3}$")
+# Whisper's word timings follow the transcript after this marker, one
+# ``<|start|> word <|end|>`` per word in the same timestamp vocabulary
+_WORDS_MARKER = "<|startoflm|>"
+
+
+# sampling knobs the engine reads as numbers; a string there fails every
+# request batched with it, so they are checked before submission
+_NUMERIC_KWARGS = {
+    "temperature": float, "top_p": float, "min_p": float, "repetition_penalty": float,
+    "top_k": int, "max_output_tokens": int, "seed": int,
+}
+
+
+def _check_numeric_kwargs(mk: dict) -> dict:
+    """Coerce the known numeric ``model_kwargs`` to numbers, or raise ValueError."""
+    for key, kind in _NUMERIC_KWARGS.items():
+        value = mk.get(key)
+        if value is None or (kind is int and isinstance(value, int) and not isinstance(value, bool)):
+            continue
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"{key} must be a number; got {value!r}") from None
+        if not math.isfinite(number) or (kind is int and not number.is_integer()):
+            raise ValueError(f"{key} must be a finite {kind.__name__}; got {value!r}")
+        mk[key] = kind(number)
+    return mk
+
+
+def _transcription_kwargs(req: TranscriptionRequest) -> dict:
+    """Map the OpenAI transcription fields shared by every ASR model onto
+    ``model_kwargs``. ``language`` / ``temperature`` / ``seed`` pass through
+    under their own names; ``prompt`` becomes ``initial_prompt`` (the
+    conditioning text, named as faster-whisper does — ``prompt`` itself is
+    the request's text argument); a timestamped ``response_format`` or an
+    explicit granularity asks the model for timestamps."""
+    mk = _passthrough(req)
+    if req.language:
+        mk.setdefault("language", req.language)
+    if req.prompt:
+        mk.setdefault("initial_prompt", req.prompt)
+    if req.temperature is not None:
+        mk.setdefault("temperature", req.temperature)
+    if req.seed is not None:
+        mk.setdefault("seed", req.seed)
+    granularities = set(req.timestamp_granularities or ())
+    if "word" in granularities:
+        mk.setdefault("timestamps", "word")
+    elif granularities or req.response_format in ("verbose_json", "srt", "vtt"):
+        mk.setdefault("timestamps", "segment")
+    return _check_numeric_kwargs(mk)
+
+
+class WhisperAdapter(OpenAIAdapter):
+    """Whisper (large-v3, large-v3-turbo): speech-to-text.
+
+    The transcript stream is Whisper's own token stream rendered as text:
+    a leading ``<|xx|>`` language token when the language was detected or
+    forced, and ``<|s.ss|>`` timestamp tokens around each segment when
+    timestamps were requested. ``parse_transcript`` lifts those into
+    :class:`Transcript`; ``stream_text`` hides them from streaming clients.
+    """
+
+    supports_transcriptions = True
+    # Whisper hears one 30 s window. The route cuts longer uploads into them,
+    # each starting where the previous window's last segment closed.
+    max_audio_seconds = 30.0
+    seeks_by_timestamps = True
+
+    def transcription_to_request(self, req: TranscriptionRequest, audio_path: str) -> SubmitArgs:
+        return SubmitArgs(
+            # Whisper is conditioned by its forced token prompt, not free text, so
+            # ``prompt`` reaches the model as the ``initial_prompt`` kwarg
+            # (``<|startofprev|>`` context).
+            text="",
+            file_paths={"audio": [audio_path]},
+            input_modalities=["audio", "text"],
+            output_modalities=["text"],
+            model_kwargs=_transcription_kwargs(req),
+        )
+
+    def stream_text(self, raw: str) -> str:
+        raw = raw.partition(_WORDS_MARKER)[0]  # word timings follow the transcript
+        return _CONTROL_TOKEN.sub("", _PARTIAL_CONTROL_TOKEN.sub("", raw))
+
+    def parse_transcript(self, text: str, req: TranscriptionRequest) -> Transcript:
+        text, _, timed_words = text.partition(_WORDS_MARKER)
+        language, segments, parts, unfinished = _parse_timestamped(text)
+        clean = " ".join(p.strip() for p in parts if p.strip())
+        for idx, seg in enumerate(segments):
+            seg["id"] = idx
+        words = [
+            {"word": seg["text"], "start": seg["start"], "end": seg["end"]}
+            for seg in _parse_timestamped(timed_words)[1]
+        ] if timed_words else []
+        return Transcript(
+            text=clean, language=language or req.language, segments=segments, words=words,
+            unfinished=unfinished,
+        )
+
+
+def _parse_timestamped(text: str) -> tuple[str | None, list[dict], list[str], bool]:
+    """Walk Whisper's rendered stream: ``(language, closed segments, text
+    pieces in order, whether a segment was left open)``. A segment is the
+    text between a start and an end timestamp; text outside timestamps is
+    kept as is."""
+    language: str | None = None
+    segments: list[dict] = []
+    parts: list[str] = []
+    start: float | None = None
+    buffer: list[str] = []
+    cursor = 0
+    for match in _CONTROL_TOKEN.finditer(text):
+        span = text[cursor:match.start()]
+        cursor = match.end()
+        (buffer if start is not None else parts).append(span)
+        token = match.group(1)
+        if _TIMESTAMP.match(token):
+            stamp = float(token)
+            if start is None:
+                start = stamp
+            else:
+                segment_text = "".join(buffer).strip()
+                if segment_text:
+                    segments.append({"start": start, "end": stamp, "text": segment_text})
+                    parts.append(segment_text)
+                buffer = []
+                start = None
+        elif language is None and _LANGUAGE.match(token):
+            language = token
+    tail = text[cursor:]
+    (buffer if start is not None else parts).append(tail)
+    if start is not None and "".join(buffer).strip():
+        # an open segment at the end of the stream: keep its text, no end
+        parts.append("".join(buffer).strip())
+    return language, segments, parts, start is not None
+
+
+class HiggsAudioAdapter(OpenAIAdapter):
+    """Higgs-Audio v3 STT: an instruction-following LLM decoder, so the OpenAI
+    ``prompt`` is the transcription instruction (the model has a default)."""
+
+    supports_transcriptions = True
+
+    def transcription_to_request(self, req: TranscriptionRequest, audio_path: str) -> SubmitArgs:
+        mk = _transcription_kwargs(req)
+        mk.pop("initial_prompt", None)
+        return SubmitArgs(
+            text=req.prompt or "",
+            file_paths={"audio": [audio_path]},
+            input_modalities=["audio", "text"],
+            output_modalities=["text"],
+            model_kwargs=mk,
+        )
+
+
 # Only models with an OpenAI-standard surface are registered. Action/world-model
 # models (pi05, vjepa2) are deliberately absent → /v1/* 404s; use /generate.
 ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "bagel": BagelAdapter(),
+    "chatterbox": ChatterboxAdapter(),
+    "chatterbox_multilingual": ChatterboxAdapter(),
+    "chatterbox_turbo": ChatterboxAdapter(),
     "qwen3_omni": Qwen3OmniAdapter(),
     "omnivoice": OmniVoiceAdapter(),
     "orpheus": OrpheusAdapter(),
+    "qwen3_tts": Qwen3TTSAdapter(),
+    "qwen3_tts_1p7b": Qwen3TTSAdapter(),
+    "qwen3_tts_voicedesign": Qwen3TTSAdapter(),
+    "qwen3_tts_base": Qwen3TTSAdapter(),
     "kokoro": KokoroAdapter(),
     "cosmos3": Cosmos3Adapter(),
     "cosmos3_droid": Cosmos3Adapter(),
@@ -583,7 +1054,17 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "cosmos3_super_i2v_4step": Cosmos3Adapter(),
     "cosmos3_super_t2i_4step": Cosmos3Adapter(),
     "wan22": Wan22Adapter(),
+    "whisper_large": WhisperAdapter(),
+    "higgs_audio": HiggsAudioAdapter(),
+    "flux2_klein": DiffusionImageAdapter(),
+    "flux2_klein_9b": DiffusionImageAdapter(),
+    "z_image_turbo": DiffusionImageAdapter(),
 }
+
+# One key per size; every size takes the same adapter.
+ADAPTER_REGISTRY.update({
+    f"qwen3_5_{size}b": Qwen3_5Adapter() for size in QWEN_3_5_DENSE_SIZES
+})
 
 
 def get_adapter(model_name: str) -> OpenAIAdapter | None:
